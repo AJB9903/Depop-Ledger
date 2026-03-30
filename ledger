@@ -1,0 +1,849 @@
+Resaleprofitledger · JSX
+Copy
+
+import { useState, useCallback, useRef, useMemo } from "react";
+ 
+// ═══════════════════════════════════════════════════════════════
+// ENGINE — merge / dedup (unchanged)
+// ═══════════════════════════════════════════════════════════════
+ 
+function parseMoney(val) {
+  if (val === null || val === undefined) return 0;
+  const s = String(val).replace(/[$,]/g, "").trim();
+  if (["", "-", '="-"', '"-"'].includes(s)) return 0;
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+ 
+function simpleHash(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash) ^ str.charCodeAt(i);
+    hash = hash >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0").toUpperCase() +
+         str.length.toString(16).padStart(4, "0").toUpperCase();
+}
+ 
+function generateTxnId(row) {
+  if (row["Transaction ID"] && row["Transaction ID"].toString().trim() !== "")
+    return { id: row["Transaction ID"].toString().trim(), type: "depop" };
+  const raw = `${row["Date of sale"]}_${row["Name"]}_${row["Item price"]}`;
+  return { id: "HASH_" + simpleHash(raw), type: "hash" };
+}
+ 
+function normalizeName(name) { return String(name).toLowerCase().replace(/[^a-z]/g, ""); }
+ 
+function nameSimilarity(a, b) {
+  const na = normalizeName(a), nb = normalizeName(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  const shorter = na.length <= nb.length ? na : nb;
+  const longer  = na.length <= nb.length ? nb : na;
+  let matches = 0;
+  for (const ch of shorter) if (longer.includes(ch)) matches++;
+  return matches / longer.length;
+}
+ 
+function parsePirateShipRows(rows) {
+  const labels = [];
+  for (const row of rows) {
+    if (row["Type"] !== "Label") continue;
+    const desc = String(row["Description"] || "");
+    const name = desc.split(":")[0].trim();
+    const cost = Math.abs(parseMoney(row["Total"]));
+    const dateStr = String(row["Date"] || "").replace(/ EDT$/, "").replace(/ EST$/, "").trim();
+    const date = new Date(dateStr);
+    if (!isNaN(date.getTime()) && name) labels.push({ name, date, cost });
+  }
+  return labels;
+}
+ 
+export function mergeAndDeduplicate(depopRows, pirateShipRows, existingIds = new Set()) {
+  const labels = parsePirateShipRows(pirateShipRows);
+  const usedLabelIndices = new Set();
+  const transactions = [], orphanedLabels = [];
+  const seenIds = new Set(existingIds);
+ 
+  for (const row of depopRows) {
+    const { id: txnId, type: idType } = generateTxnId(row);
+    if (seenIds.has(txnId)) continue; // dedup gate
+    seenIds.add(txnId);
+ 
+    const saleDate      = new Date(row["Date of sale"]);
+    const buyerName     = String(row["Name"] || "").trim();
+    const itemPrice     = parseMoney(row["Item price"]);
+    const depopFee      = parseMoney(row["Depop fee"]);
+    const depopPayFee   = parseMoney(row["Depop Payments fee"]);
+    const boostingFee   = parseMoney(row["Boosting fee"]);
+    const buyerShipping = parseMoney(row["Buyer shipping cost"]);
+    const totalFees     = depopFee + depopPayFee + boostingFee;
+ 
+    let bestMatch = null, bestScore = 0, bestIdx = -1;
+    for (let i = 0; i < labels.length; i++) {
+      if (usedLabelIndices.has(i)) continue;
+      const label = labels[i];
+      const daysDiff = Math.abs((label.date.getTime() - saleDate.getTime()) / 86400000);
+      if (daysDiff > 5) continue;
+      const score = nameSimilarity(buyerName, label.name);
+      if (score > bestScore && score > 0.7) { bestScore = score; bestMatch = label; bestIdx = i; }
+    }
+ 
+    let labelCost = 0, shippingDate = null;
+    if (bestMatch) {
+      usedLabelIndices.add(bestIdx);
+      labelCost = bestMatch.cost;
+      shippingDate = bestMatch.date.toISOString().split("T")[0];
+    }
+ 
+    const grossProfit = Math.round((itemPrice - totalFees - labelCost) * 100) / 100;
+    transactions.push({
+      transactionId: txnId, idType,
+      saleDate: row["Date of sale"],
+      itemName: String(row["Description"] || "").slice(0, 80).trim(),
+      brand: String(row["Brand"] || "").trim(),
+      category: String(row["Category"] || "Other").trim(),
+      buyerUsername: String(row["Buyer"] || "").trim(),
+      buyerName, postCode: String(row["Post Code"] || "").trim(),
+      salePrice: itemPrice, buyerShipping, depopFee,
+      depopPaymentsFee: depopPayFee, boostingFee,
+      totalFees: Math.round(totalFees * 100) / 100,
+      labelCost, shippingDate,
+      matchConfidence: bestMatch ? Math.round(bestScore * 100) / 100 : null,
+      grossProfit, cogs: null, netProfit: null,
+      isOrphaned: !bestMatch,
+      orphanReason: !bestMatch ? "No matching shipping label found" : null,
+    });
+  }
+ 
+  for (let i = 0; i < labels.length; i++) {
+    if (!usedLabelIndices.has(i)) {
+      const label = labels[i];
+      orphanedLabels.push({
+        type: "orphaned_label", buyerName: label.name,
+        date: label.date.toISOString().split("T")[0],
+        labelCost: label.cost, note: "Pirate Ship label with no matching Depop sale",
+      });
+    }
+  }
+  return { transactions, orphanedLabels };
+}
+ 
+export function useLedgerParser() {
+  const parseCsv = useCallback((file) => new Promise((resolve, reject) => {
+    if (typeof Papa === "undefined") { reject(new Error("PapaParse not loaded.")); return; }
+    Papa.parse(file, { header: true, skipEmptyLines: true, complete: r => resolve(r.data), error: reject });
+  }), []);
+ 
+  const parseXlsx = useCallback((file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        if (typeof XLSX === "undefined") throw new Error("SheetJS not loaded.");
+        const wb = XLSX.read(e.target.result, { type: "binary" });
+        resolve(XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: "" }));
+      } catch (err) { reject(err); }
+    };
+    reader.readAsBinaryString(file);
+  }), []);
+ 
+  return { parseCsv, parseXlsx };
+}
+ 
+// ═══════════════════════════════════════════════════════════════
+// DEMO DATA — Oct–Dec 2025 (category field added)
+// ═══════════════════════════════════════════════════════════════
+ 
+const D = [
+  {transactionId:"HASH_2A22CEB79374",idType:"hash",saleDate:"10/01/2025",itemName:"Todd Snyder X Champion Jogger Pans Mens XL Brown Sweatpants Fleece Drawstring",brand:"Todd Snyder",category:"Bottoms",buyerUsername:"mrblakeley7",buyerName:"L Blakeley",postCode:"07102",salePrice:23,buyerShipping:8,depopFee:0,depopPaymentsFee:1.47,boostingFee:2.48,totalFees:3.95,labelCost:6.34,shippingDate:"2025-10-01",matchConfidence:1,grossProfit:12.71,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_E6CEE2E9B557",idType:"hash",saleDate:"10/02/2025",itemName:"Diesel Jeans Men's Viker Distressed Regular Fit measures 36x31",brand:"Diesel",category:"Bottoms",buyerUsername:"noahts22",buyerName:"Noah Sargent",postCode:"43068-1337",salePrice:25,buyerShipping:8.99,depopFee:0,depopPaymentsFee:1.67,boostingFee:0,totalFees:1.67,labelCost:6.34,shippingDate:"2025-10-03",matchConfidence:1,grossProfit:16.99,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_4639A760320D",idType:"hash",saleDate:"10/04/2025",itemName:"Y2K grunge skull extremely sunfaded fender guitars tee men's xl",brand:"Fender",category:"Tops",buyerUsername:"bandojr",buyerName:"Brandon Radul",postCode:"33326-2161",salePrice:7,buyerShipping:8,depopFee:0,depopPaymentsFee:0.98,boostingFee:1.2,totalFees:2.18,labelCost:5.86,shippingDate:"2025-10-06",matchConfidence:1,grossProfit:-1.04,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_FF86B9B566E0",idType:"hash",saleDate:"10/04/2025",itemName:"G.H. bass 34x30 green pants",brand:"G.H. Bass",category:"Bottoms",buyerUsername:"mlc8761",buyerName:"Matt Corey",postCode:"36695-4363",salePrice:5.99,buyerShipping:8,depopFee:0,depopPaymentsFee:0.93,boostingFee:0,totalFees:0.93,labelCost:7.67,shippingDate:"2025-10-06",matchConfidence:1,grossProfit:-2.61,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_4C31F8632A69",idType:"hash",saleDate:"10/06/2025",itemName:"Peter millar light blue quarter zip pullover sweater size medium",brand:"Peter Millar",category:"Tops",buyerUsername:"cadehardy34",buyerName:"Cade",postCode:"40503-1058",salePrice:15,buyerShipping:8,depopFee:0,depopPaymentsFee:1.26,boostingFee:1.84,totalFees:3.1,labelCost:6.6,shippingDate:"2025-10-06",matchConfidence:1,grossProfit:5.3,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_E4971F26C8B1",idType:"hash",saleDate:"10/09/2025",itemName:"Structure xl chunky knit geometric patterned sweater super thick",brand:"Other",category:"Tops",buyerUsername:"al3xandri0us",buyerName:"Alex Lara",postCode:"90043-4174",salePrice:19,buyerShipping:8,depopFee:0,depopPaymentsFee:1.41,boostingFee:0,totalFees:1.41,labelCost:11.71,shippingDate:"2025-10-09",matchConfidence:1,grossProfit:5.88,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_239E0BC7C94B",idType:"hash",saleDate:"10/09/2025",itemName:"Vintage Majestic Washington Nationals Mens Large Red Pullover (Inaugural Season)",brand:"Majestic Athletic",category:"Tops",buyerUsername:"davistaylor1",buyerName:"Davis Taylor",postCode:"37920-3095",salePrice:28,buyerShipping:8,depopFee:0,depopPaymentsFee:1.75,boostingFee:2.88,totalFees:4.63,labelCost:6.73,shippingDate:"2025-10-09",matchConfidence:1,grossProfit:16.64,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_3B970D45C281",idType:"hash",saleDate:"10/12/2025",itemName:"Vintage MINNESOTA TWINS Baseball NEW 90s XXL Logo Blue T Shirt",brand:"Hanes",category:"Tops",buyerUsername:"andrerrr",buyerName:"Andre Romero",postCode:"84097-4348",salePrice:9.99,buyerShipping:8,depopFee:0,depopPaymentsFee:1.07,boostingFee:1.44,totalFees:2.51,labelCost:6.18,shippingDate:"2025-10-13",matchConfidence:1,grossProfit:1.3,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_37AC78A92959",idType:"hash",saleDate:"10/21/2025",itemName:"James Perse Standard Mens chino Pants tagged 36 measure 34x32 cotton Brown",brand:"James Perse",category:"Bottoms",buyerUsername:"henrymills17",buyerName:"Henry Mills",postCode:"10009-8402",salePrice:19.99,buyerShipping:8,depopFee:0,depopPaymentsFee:1.37,boostingFee:2.24,totalFees:3.61,labelCost:0,shippingDate:null,matchConfidence:null,grossProfit:16.38,cogs:null,netProfit:null,isOrphaned:true,orphanReason:"No matching shipping label found"},
+  {transactionId:"HASH_7763440389E0",idType:"hash",saleDate:"10/29/2025",itemName:"Vintage Carhartt Detroit Jacket J97 GVL Blanket Lined Mens Large Tall Flannel",brand:"Carhartt",category:"Outerwear",buyerUsername:"adriannimri",buyerName:"Adrian Nimri",postCode:"77095-2253",salePrice:265,buyerShipping:12,depopFee:0,depopPaymentsFee:10.38,boostingFee:22.16,totalFees:32.54,labelCost:10.08,shippingDate:"2025-10-29",matchConfidence:1,grossProfit:222.38,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_0CCB90663869",idType:"hash",saleDate:"11/11/2025",itemName:"Vintage geometric textured all over print graphic cozy warm sweater adult",brand:"Haggar",category:"Tops",buyerUsername:"radnia_4711",buyerName:"Rose Dennis",postCode:"22201-6801",salePrice:9.99,buyerShipping:8,depopFee:0,depopPaymentsFee:1.07,boostingFee:1.44,totalFees:2.51,labelCost:0,shippingDate:null,matchConfidence:null,grossProfit:7.48,cogs:null,netProfit:null,isOrphaned:true,orphanReason:"No matching shipping label found"},
+  {transactionId:"HASH_DB2F63A3B180",idType:"hash",saleDate:"11/15/2025",itemName:"J14 BRN Medium Vintage Carhartt Santa Fe Jacket",brand:"Carhartt",category:"Outerwear",buyerUsername:"sincerelyemma3",buyerName:"emma gupta",postCode:"06050",salePrice:139.99,buyerShipping:8,depopFee:0,depopPaymentsFee:5.66,boostingFee:11.84,totalFees:17.5,labelCost:8,shippingDate:"2025-11-15",matchConfidence:1,grossProfit:114.49,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_2C96EB38A8F5",idType:"hash",saleDate:"11/16/2025",itemName:"LL Bean Peanuts Snoopy Collab Crewneck Sweatshirt Size XS Limited Edition",brand:"L.L.Bean",category:"Tops",buyerUsername:"mnd43214",buyerName:"Mike Lo",postCode:"19801",salePrice:11,buyerShipping:8,depopFee:0,depopPaymentsFee:1.08,boostingFee:1.52,totalFees:2.6,labelCost:6.17,shippingDate:"2025-11-16",matchConfidence:1,grossProfit:2.23,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_0CE721E4A1D6",idType:"hash",saleDate:"11/17/2025",itemName:"Mens large vintage 80s 90s umbro soccer jersey metallic looking material",brand:"Umbro",category:"Tops",buyerUsername:"albneedshoes",buyerName:"Albert",postCode:"90012-4908",salePrice:9.99,buyerShipping:6,depopFee:0,depopPaymentsFee:1.01,boostingFee:0,totalFees:1.01,labelCost:5.37,shippingDate:"2025-11-17",matchConfidence:1,grossProfit:3.61,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_A6BEF08BDA35",idType:"hash",saleDate:"11/17/2025",itemName:"Todd Snyder X Champion Jogger Pans Mens XL Brown Sweatpants Fleece Drawstring",brand:"Todd Snyder",category:"Bottoms",buyerUsername:"mrblakeley7",buyerName:"L Blakeley",postCode:"07102",salePrice:23,buyerShipping:8,depopFee:0,depopPaymentsFee:1.47,boostingFee:2.48,totalFees:3.95,labelCost:6.54,shippingDate:"2025-11-17",matchConfidence:1,grossProfit:12.51,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_371F3645281E",idType:"hash",saleDate:"11/19/2025",itemName:"Canada mock neck hoodie crew neck jacket size large",brand:"Other",category:"Tops",buyerUsername:"hwoods353",buyerName:"Hailey woods",postCode:"56082-2148",salePrice:11,buyerShipping:8,depopFee:0,depopPaymentsFee:1.08,boostingFee:1.52,totalFees:2.6,labelCost:7.67,shippingDate:"2025-11-18",matchConfidence:1,grossProfit:0.73,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_EA757CC3FF20",idType:"hash",saleDate:"11/19/2025",itemName:"Oakley Static Wave BlackOut Hoodie HydroLix Large",brand:"Oakley",category:"Tops",buyerUsername:"mayobruh",buyerName:"Adrian Mayorga",postCode:"95122",salePrice:14,buyerShipping:8,depopFee:0,depopPaymentsFee:1.22,boostingFee:1.76,totalFees:2.98,labelCost:9.06,shippingDate:"2025-11-18",matchConfidence:1,grossProfit:1.96,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_061203948EEF",idType:"hash",saleDate:"11/19/2025",itemName:"The North Face Jacket Mens Medium Gray Full Zip Mock Neck Logo Outdoors Fleece",brand:"The North Face",category:"Outerwear",buyerUsername:"derek72525",buyerName:"Derek Roxbury",postCode:"06877-5230",salePrice:23,buyerShipping:8,depopFee:0,depopPaymentsFee:1.54,boostingFee:0,totalFees:1.54,labelCost:6.52,shippingDate:"2025-11-18",matchConfidence:1,grossProfit:14.94,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_1449C2F45484",idType:"hash",saleDate:"11/19/2025",itemName:"Smack talk tee cowboys fan adult xl",brand:"Other",category:"Tops",buyerUsername:"johnny_carciofi",buyerName:"John Kolenda",postCode:"12580-6132",salePrice:4.99,buyerShipping:8,depopFee:0,depopPaymentsFee:0.88,boostingFee:0,totalFees:0.88,labelCost:5.64,shippingDate:"2025-11-21",matchConfidence:1,grossProfit:-1.53,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_CA6936922271",idType:"hash",saleDate:"11/22/2025",itemName:"Empyre 36x30 Corduroy Skate Pants (Light Purple)",brand:"Empyre",category:"Bottoms",buyerUsername:"katmo90",buyerName:"Katie Mora",postCode:"87144-3703",salePrice:31,buyerShipping:8,depopFee:0,depopPaymentsFee:1.84,boostingFee:3.12,totalFees:4.96,labelCost:9.31,shippingDate:"2025-11-23",matchConfidence:1,grossProfit:16.73,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_B38AC1655A54",idType:"hash",saleDate:"11/22/2025",itemName:"Men's PHG performance hunting gear camouflage pants 38x32",brand:"Columbia Sportswear",category:"Bottoms",buyerUsername:"witherwitches",buyerName:"Austin Heroux",postCode:"95626-9411",salePrice:10,buyerShipping:8,depopFee:0,depopPaymentsFee:1.07,boostingFee:0,totalFees:1.07,labelCost:6.37,shippingDate:"2025-11-23",matchConfidence:1,grossProfit:2.56,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_93F1C43E5F86",idType:"hash",saleDate:"11/23/2025",itemName:"Nike Virginia tech Hokies football jersey Kyron Drones Number 1 XL Team Issued",brand:"Nike",category:"Tops",buyerUsername:"kjacks677",buyerName:"Kyle Jackson",postCode:"28173-7964",salePrice:79.99,buyerShipping:8,depopFee:0,depopPaymentsFee:3.56,boostingFee:0,totalFees:3.56,labelCost:5.71,shippingDate:"2025-11-23",matchConfidence:1,grossProfit:70.72,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_1ED2FCA39628",idType:"hash",saleDate:"11/29/2025",itemName:"Vintage 1998 Bill Goldberg WCW World Championship Wrestling Large T-Shirt",brand:"Tultex",category:"Tops",buyerUsername:"vntgepoint",buyerName:"Michael Douglas",postCode:"34606-4714",salePrice:19,buyerShipping:8,depopFee:0,depopPaymentsFee:1.4,boostingFee:2.16,totalFees:3.56,labelCost:5.86,shippingDate:"2025-11-30",matchConfidence:1,grossProfit:9.58,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_54207FFCFB00",idType:"hash",saleDate:"12/02/2025",itemName:"NIKE ACG XL Maroon Full Zip Long Sleeve Mock Neck Sweatshirt W Pockets",brand:"Nike ACG",category:"Tops",buyerUsername:"jrod8926",buyerName:"Jaylen Rodriguez",postCode:"07901-3583",salePrice:17.5,buyerShipping:8,depopFee:0,depopPaymentsFee:1.29,boostingFee:2.04,totalFees:3.33,labelCost:6.54,shippingDate:"2025-12-07",matchConfidence:1,grossProfit:7.63,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_8533EC53ED8F",idType:"hash",saleDate:"12/08/2025",itemName:"Vintage XL Long sleeve Y2K grunge affliction style Harley Davidson Shirt",brand:"Harley Davidson",category:"Tops",buyerUsername:"karl_knob",buyerName:"Justin Yarmie",postCode:"85283",salePrice:58,buyerShipping:8,depopFee:0,depopPaymentsFee:2.78,boostingFee:0,totalFees:2.78,labelCost:5.37,shippingDate:"2025-12-07",matchConfidence:1,grossProfit:49.85,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_98A5E3EBAFBC",idType:"hash",saleDate:"12/09/2025",itemName:"Vintage Large Umbro England 2006 08 Soccer jersey",brand:"Umbro",category:"Tops",buyerUsername:"bigpickenergy",buyerName:"Lindsey Dixon",postCode:"75224",salePrice:14.99,buyerShipping:8,depopFee:0,depopPaymentsFee:1.28,boostingFee:1.84,totalFees:3.12,labelCost:5.15,shippingDate:"2025-12-10",matchConfidence:1,grossProfit:6.72,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_8379C5A02B48",idType:"hash",saleDate:"12/10/2025",itemName:"New Balance 990v4 Made in USA classic grey silver colorway. Suede and mesh",brand:"New Balance",category:"Footwear",buyerUsername:"aaronhau2001",buyerName:"Shihhao Huang",postCode:"19720",salePrice:40,buyerShipping:8,depopFee:0,depopPaymentsFee:2.03,boostingFee:3.84,totalFees:5.87,labelCost:6.51,shippingDate:"2025-12-10",matchConfidence:1,grossProfit:27.62,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_BEDFE74E8FF4",idType:"hash",saleDate:"12/11/2025",itemName:"Vintage 90s Carhartt denim hooded jacket flannel lined size M model JB1198",brand:"Carhartt",category:"Outerwear",buyerUsername:"jake3396",buyerName:"Jake Salzsiedler",postCode:"55418",salePrice:333.33,buyerShipping:8,depopFee:0,depopPaymentsFee:11.71,boostingFee:27.31,totalFees:39.02,labelCost:8.58,shippingDate:"2025-12-11",matchConfidence:1,grossProfit:285.73,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_7DABA155829F",idType:"hash",saleDate:"12/12/2025",itemName:"Stussy Ripstop Pullover Jacket Large Orange Neon Logo",brand:"Stussy",category:"Outerwear",buyerUsername:"johnnyweinerson",buyerName:"JyMaire",postCode:"19122",salePrice:31,buyerShipping:8,depopFee:0,depopPaymentsFee:1.74,boostingFee:3.12,totalFees:4.86,labelCost:6.54,shippingDate:"2025-12-12",matchConfidence:1,grossProfit:19.6,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_52E4CFBD7D53",idType:"hash",saleDate:"12/12/2025",itemName:"Levis 505 regular fit medium wash clean condition classic straight leg",brand:"Levi's",category:"Bottoms",buyerUsername:"sweatpantsh",buyerName:"Justin Reed",postCode:"78258-3563",salePrice:16.99,buyerShipping:8,depopFee:0,depopPaymentsFee:1.35,boostingFee:2,totalFees:3.35,labelCost:8.98,shippingDate:"2025-12-13",matchConfidence:1,grossProfit:4.66,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_71BACE96D8DB",idType:"hash",saleDate:"12/13/2025",itemName:"Habit two-tone hunting jacket camo upper forest green fleece",brand:"Realtree",category:"Outerwear",buyerUsername:"vintagefanatic72",buyerName:"Dayton Menendez",postCode:"30016-7703",salePrice:14,buyerShipping:8,depopFee:0,depopPaymentsFee:1.23,boostingFee:1.76,totalFees:2.99,labelCost:6.73,shippingDate:"2025-12-13",matchConfidence:1,grossProfit:4.28,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_2E646D60D80F",idType:"hash",saleDate:"12/13/2025",itemName:"Marmot deep pile fleece army green full zip front",brand:"Marmot",category:"Outerwear",buyerUsername:"marrr412",buyerName:"Marley Thelen",postCode:"34683-2828",salePrice:27.99,buyerShipping:8,depopFee:0,depopPaymentsFee:1.73,boostingFee:0,totalFees:1.73,labelCost:7.67,shippingDate:"2025-12-13",matchConfidence:1,grossProfit:18.59,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_F3AE8B6799CB",idType:"hash",saleDate:"12/15/2025",itemName:"Long sleeve vintage 90s chamois deerskin melton shirt duck camo",brand:"Other",category:"Tops",buyerUsername:"finessee_3",buyerName:"Pitou Roeun",postCode:"17104-2005",salePrice:15,buyerShipping:8,depopFee:0,depopPaymentsFee:1.21,boostingFee:0,totalFees:1.21,labelCost:6.41,shippingDate:"2025-12-15",matchConfidence:1,grossProfit:7.38,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_D5FC4863DFBF",idType:"hash",saleDate:"12/16/2025",itemName:"Carhartt B172 DST flannel lined jeans tagged 36x30",brand:"Carhartt",category:"Bottoms",buyerUsername:"thrivingthrifd",buyerName:"Brandon Dukes",postCode:"20772-4112",salePrice:23,buyerShipping:8,depopFee:0,depopPaymentsFee:1.52,boostingFee:2.48,totalFees:4,labelCost:6.44,shippingDate:"2025-12-17",matchConfidence:1,grossProfit:12.56,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_44219BAC70E2",idType:"hash",saleDate:"12/16/2025",itemName:"Polo Ralph Lauren Sweater Men M Quarter Zip Pullover Snap Navy Utility Work VTG",brand:"Polo Ralph Lauren",category:"Tops",buyerUsername:"alessios_",buyerName:"Alejandro Carranco",postCode:"78207-2462",salePrice:25,buyerShipping:8,depopFee:0,depopPaymentsFee:1.63,boostingFee:2.64,totalFees:4.27,labelCost:8.98,shippingDate:"2025-12-17",matchConfidence:1,grossProfit:11.75,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_9A4507DC74D4",idType:"hash",saleDate:"12/17/2025",itemName:"Modern aop virginia tech hokies shirt mens medium",brand:"NCAA",category:"Tops",buyerUsername:"wilttravis63",buyerName:"Travis Wilt",postCode:"20106-2279",salePrice:5.99,buyerShipping:8,depopFee:0,depopPaymentsFee:0.92,boostingFee:1.12,totalFees:2.04,labelCost:0,shippingDate:null,matchConfidence:null,grossProfit:3.95,cogs:null,netProfit:null,isOrphaned:true,orphanReason:"No matching shipping label found"},
+  {transactionId:"HASH_F475F6391D92",idType:"hash",saleDate:"12/18/2025",itemName:"Barry Bricken wool sweater snake graphics throughout heavyweight chunky knit",brand:"Other",category:"Tops",buyerUsername:"carolinetopham",buyerName:"Caroline Topham",postCode:"64118-1172",salePrice:47.99,buyerShipping:8,depopFee:0,depopPaymentsFee:2.47,boostingFee:4.48,totalFees:6.95,labelCost:7.67,shippingDate:"2025-12-18",matchConfidence:1,grossProfit:33.37,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_C2F4750646D4",idType:"hash",saleDate:"12/19/2025",itemName:"Harley Davidson Y2K Reading PA front and back graphic hoodie",brand:"Harley Davidson",category:"Tops",buyerUsername:"thefirstnoelm",buyerName:"Noel Mckinnon",postCode:"28262-1603",salePrice:14,buyerShipping:8,depopFee:0,depopPaymentsFee:1.23,boostingFee:0,totalFees:1.23,labelCost:6.73,shippingDate:"2025-12-23",matchConfidence:1,grossProfit:6.04,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_3D668D5066BD",idType:"hash",saleDate:"12/23/2025",itemName:"BASIX Fenn Wright Manson heavyweight cable knit sweater deep forest green",brand:"Other",category:"Tops",buyerUsername:"chien_furieux",buyerName:"Madeline Tome",postCode:"94708",salePrice:37.99,buyerShipping:8,depopFee:0,depopPaymentsFee:2.1,boostingFee:0,totalFees:2.1,labelCost:10,shippingDate:"2025-12-23",matchConfidence:1,grossProfit:25.89,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_3A5DA6BDE338",idType:"hash",saleDate:"12/25/2025",itemName:"Carhartt K124 Original Fit Navy Crewneck Pullover L",brand:"Carhartt",category:"Tops",buyerUsername:"davantesjames",buyerName:"Davante James",postCode:"07017",salePrice:20,buyerShipping:8,depopFee:0,depopPaymentsFee:1.37,boostingFee:0,totalFees:1.37,labelCost:6.54,shippingDate:"2025-12-25",matchConfidence:1,grossProfit:12.09,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+  {transactionId:"HASH_7F1EA3A5CC97",idType:"hash",saleDate:"12/25/2025",itemName:"Vintage 2000s Columbia Padded Anorak Parka L",brand:"Columbia Sportswear",category:"Outerwear",buyerUsername:"rello3099",buyerName:"Terrell Hickson",postCode:"01109-1544",salePrice:52.5,buyerShipping:8,depopFee:0,depopPaymentsFee:2.45,boostingFee:4.84,totalFees:7.29,labelCost:6.73,shippingDate:"2025-12-25",matchConfidence:1,grossProfit:38.48,cogs:null,netProfit:null,isOrphaned:false,orphanReason:null},
+];
+ 
+const DEMO_ORPHANED = [
+  {type:"orphaned_label",buyerName:"Paul Mooradian",date:"2025-12-09",labelCost:11.71,note:"Pirate Ship label with no matching Depop sale"},
+  {type:"orphaned_label",buyerName:"ThriftyRome",date:"2025-10-17",labelCost:6.73,note:"Pirate Ship label with no matching Depop sale"},
+  {type:"orphaned_label",buyerName:"Evan Steinberg",date:"2025-10-01",labelCost:5.70,note:"Pirate Ship label with no matching Depop sale"},
+];
+ 
+// ═══════════════════════════════════════════════════════════════
+// DESIGN TOKENS
+// ═══════════════════════════════════════════════════════════════
+ 
+const C = {
+  bg:       "#121212",
+  surf:     "rgba(255,255,255,0.055)",
+  surfHi:   "rgba(255,255,255,0.09)",
+  border:   "rgba(255,255,255,0.07)",
+  amber:    "#FFBF00",
+  sage:     "#9DC183",
+  red:      "#FF6B6B",
+  pri:      "#E0E0E0",
+  mut:      "#A0A0A0",
+  dim:      "#585858",
+  r:        "24px",
+  ri:       "12px",
+  rs:       "8px",
+};
+ 
+const mono = "'Roboto Mono', 'Courier New', monospace";
+const sans = "system-ui, -apple-system, sans-serif";
+ 
+// ═══════════════════════════════════════════════════════════════
+// SPARKLINE
+// ═══════════════════════════════════════════════════════════════
+ 
+function Sparkline({ data, height = 80 }) {
+  if (!data || data.length < 2) return <div style={{ height }} />;
+  const W = 600, H = height, P = 6;
+  const max = Math.max(...data), min = Math.min(...data);
+  const range = max - min || 1;
+  const pts = data.map((v, i) => ({
+    x: P + (i / (data.length - 1)) * (W - P * 2),
+    y: H - P - ((v - min) / range) * (H - P * 2),
+  }));
+  let line = `M ${pts[0].x} ${pts[0].y}`;
+  for (let i = 1; i < pts.length; i++) {
+    const p = pts[i - 1], c = pts[i], mx = (p.x + c.x) / 2;
+    line += ` C ${mx} ${p.y} ${mx} ${c.y} ${c.x} ${c.y}`;
+  }
+  const area = `${line} L ${pts[pts.length-1].x} ${H} L ${pts[0].x} ${H} Z`;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:H, display:"block" }} preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="sg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor={C.sage} stopOpacity="0.28" />
+          <stop offset="100%" stopColor={C.sage} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <path d={area} fill="url(#sg)" />
+      <path d={line}  fill="none" stroke={C.sage} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+      <circle cx={pts[pts.length-1].x} cy={pts[pts.length-1].y} r="4" fill={C.sage} />
+    </svg>
+  );
+}
+ 
+// ═══════════════════════════════════════════════════════════════
+// PRIMITIVE COMPONENTS
+// ═══════════════════════════════════════════════════════════════
+ 
+const fm = (n) => `$${Math.abs(+n || 0).toFixed(2)}`;
+const pct = (a, b) => b ? ((a / b) * 100).toFixed(1) + "%" : "—";
+ 
+function Glass({ children, style = {}, onClick }) {
+  return (
+    <div onClick={onClick} style={{
+      background: C.surf, backdropFilter:"blur(24px)", WebkitBackdropFilter:"blur(24px)",
+      borderRadius: C.r, position:"relative", overflow:"hidden",
+      transition:"background 0.18s", cursor:onClick?"pointer":"default", ...style,
+    }}>
+      {children}
+    </div>
+  );
+}
+ 
+function Lbl({ children, style = {} }) {
+  return <div style={{ fontFamily:mono, fontSize:9, letterSpacing:"0.13em", textTransform:"uppercase", color:C.dim, ...style }}>{children}</div>;
+}
+ 
+function Pill({ children, active, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      fontFamily:mono, fontSize:11, letterSpacing:"0.05em",
+      padding:"8px 20px", border:"none", cursor:"pointer", borderRadius:C.rs,
+      transition:"all 0.18s",
+      background: active ? C.sage : "rgba(255,255,255,0.07)",
+      color: active ? "#0d1a08" : C.mut, fontWeight: active ? 700 : 400,
+    }}>{children}</button>
+  );
+}
+ 
+function Tab({ children, active, onClick, badge }) {
+  return (
+    <button onClick={onClick} style={{
+      background:"none", border:"none", cursor:"pointer", fontFamily:mono,
+      fontSize:10, letterSpacing:"0.12em", textTransform:"uppercase",
+      color: active ? C.pri : C.dim, padding:"14px 20px",
+      borderBottom: active ? `2px solid ${C.sage}` : "2px solid transparent",
+      transition:"all 0.15s", display:"flex", alignItems:"center", gap:6,
+    }}>
+      {children}
+      {badge != null && badge > 0 && (
+        <span style={{ background:C.red, color:"#fff", borderRadius:99, padding:"1px 6px", fontSize:8, fontWeight:700 }}>{badge}</span>
+      )}
+    </button>
+  );
+}
+ 
+// ═══════════════════════════════════════════════════════════════
+// DATE / FILTER HELPERS
+// ═══════════════════════════════════════════════════════════════
+ 
+function pd(str) {
+  if (!str) return null;
+  const [m, d, y] = str.split("/").map(Number);
+  return new Date(y, m - 1, d);
+}
+ 
+function filterTxns(txns, frame) {
+  if (frame === "yearly") return txns;
+  const dates = txns.map(t => pd(t.saleDate)).filter(Boolean);
+  if (!dates.length) return txns;
+  const latest = new Date(Math.max(...dates));
+  if (frame === "weekly") {
+    const cut = new Date(latest); cut.setDate(cut.getDate() - 6);
+    return txns.filter(t => { const d = pd(t.saleDate); return d && d >= cut; });
+  }
+  return txns.filter(t => { const d = pd(t.saleDate); return d && d.getMonth() === latest.getMonth() && d.getFullYear() === latest.getFullYear(); });
+}
+ 
+function sparkPoints(txns, frame) {
+  if (!txns.length) return [];
+  const dates = txns.map(t => pd(t.saleDate)).filter(Boolean);
+  const latest = new Date(Math.max(...dates));
+  const earliest = new Date(Math.min(...dates));
+  if (frame === "weekly") {
+    return Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(latest); d.setDate(d.getDate() - (6 - i));
+      return txns.filter(t => { const x = pd(t.saleDate); return x && x.getDate()===d.getDate() && x.getMonth()===d.getMonth(); }).reduce((s,t)=>s+t.salePrice,0);
+    });
+  }
+  if (frame === "monthly") {
+    const days = new Date(latest.getFullYear(), latest.getMonth()+1, 0).getDate();
+    return Array.from({ length: days }, (_, i) => {
+      const day = i + 1;
+      return txns.filter(t => { const x = pd(t.saleDate); return x && x.getDate()===day && x.getMonth()===latest.getMonth(); }).reduce((s,t)=>s+t.salePrice,0);
+    });
+  }
+  const totalDays = Math.ceil((latest - earliest) / 86400000) + 1;
+  const weeks = Math.ceil(totalDays / 7);
+  return Array.from({ length: weeks }, (_, wi) => {
+    const s = new Date(earliest); s.setDate(s.getDate() + wi * 7);
+    const e = new Date(s);       e.setDate(e.getDate() + 6);
+    return txns.filter(t => { const x = pd(t.saleDate); return x && x >= s && x <= e; }).reduce((s2,t)=>s2+t.salePrice,0);
+  });
+}
+ 
+function intel(txns) {
+  if (!txns.length) return null;
+  const rev = txns.reduce((s,t)=>s+t.salePrice,0);
+  const group = (key) => {
+    const m = {};
+    txns.forEach(t => {
+      const k = t[key] || "Other";
+      if (!m[k]) m[k] = { revenue:0, gross:0, count:0 };
+      m[k].revenue += t.salePrice; m[k].gross += t.grossProfit; m[k].count++;
+    });
+    return Object.entries(m).map(([n,v]) => ({ name:n, ...v, roi: v.revenue>0?v.gross/v.revenue:0 }));
+  };
+  const brands = group("brand"), cats = group("category");
+  return {
+    topBrand: brands.reduce((a,b) => b.revenue>a.revenue?b:a),
+    roiBrand: brands.reduce((a,b) => b.roi>a.roi?b:a),
+    topCat:   cats.reduce((a,b) => b.revenue>a.revenue?b:a),
+    roiCat:   cats.reduce((a,b) => b.roi>a.roi?b:a),
+    totalRev: rev,
+  };
+}
+ 
+// ═══════════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════════
+ 
+export default function ResaleProfitLedger() {
+  const [txns, setTxns]         = useState(D);
+  const [orphans, setOrphans]   = useState(DEMO_ORPHANED);
+  const [cogsMap, setCogsMap]   = useState({});
+  const [tab, setTab]           = useState("overview");
+  const [tf, setTf]             = useState("yearly");
+  const [sortCol, setSortCol]   = useState("saleDate");
+  const [sortDir, setSortDir]   = useState("desc");
+  const [lFilter, setLFilter]   = useState("all");
+ 
+  const { parseCsv, parseXlsx } = useLedgerParser();
+  const depopRef  = useRef();
+  const psRef     = useRef();
+ 
+  const withNet = useMemo(() => txns.map(t => {
+    const c = cogsMap[t.transactionId] !== undefined ? parseFloat(cogsMap[t.transactionId])||0 : null;
+    return { ...t, cogs:c, netProfit:c!==null?Math.round((t.grossProfit-c)*100)/100:null };
+  }), [txns, cogsMap]);
+ 
+  const filtered  = useMemo(() => filterTxns(withNet, tf), [withNet, tf]);
+  const sparkData = useMemo(() => sparkPoints(filtered, tf), [filtered, tf]);
+  const info      = useMemo(() => intel(filtered), [filtered]);
+ 
+  const totalRev  = filtered.reduce((s,t)=>s+t.salePrice,0);
+  const totalFees = filtered.reduce((s,t)=>s+t.totalFees,0);
+  const totalShip = filtered.reduce((s,t)=>s+t.labelCost,0);
+  const totalCogs = filtered.reduce((s,t)=>s+(t.cogs??0),0);
+  const grossP    = filtered.reduce((s,t)=>s+t.grossProfit,0);
+ 
+  const periodDays = useMemo(() => {
+    if (tf==="weekly") return 7;
+    if (tf==="monthly") {
+      const dates = filtered.map(t=>pd(t.saleDate)).filter(Boolean);
+      if (!dates.length) return 30;
+      const d = new Date(Math.max(...dates));
+      return new Date(d.getFullYear(), d.getMonth()+1, 0).getDate();
+    }
+    const dates = filtered.map(t=>pd(t.saleDate)).filter(Boolean);
+    if (dates.length<2) return 90;
+    return Math.ceil((Math.max(...dates)-Math.min(...dates))/86400000)+1;
+  }, [filtered, tf]);
+ 
+  const velocity      = filtered.length / periodDays;
+  const missingCogs   = withNet.filter(t=>t.cogs===null).length;
+  const missingLabels = withNet.filter(t=>t.isOrphaned).length;
+  const needsAction   = missingLabels + orphans.length;
+ 
+  const ledgerRows = useMemo(() => [...withNet]
+    .filter(t => lFilter==="orphaned"?t.isOrphaned:lFilter==="losses"?t.grossProfit<0:true)
+    .sort((a,b) => {
+      let av=a[sortCol], bv=b[sortCol];
+      if (typeof av==="string") av=av.toLowerCase();
+      if (typeof bv==="string") bv=bv.toLowerCase();
+      if (av===null) return 1; if (bv===null) return -1;
+      return sortDir==="asc"?(av>bv?1:-1):(av<bv?1:-1);
+    }), [withNet, lFilter, sortCol, sortDir]);
+ 
+  function tSort(col) {
+    if (sortCol===col) setSortDir(d=>d==="asc"?"desc":"asc");
+    else { setSortCol(col); setSortDir("desc"); }
+  }
+ 
+  async function upload() {
+    const df=depopRef.current?.files?.[0], pf=psRef.current?.files?.[0];
+    if(!df||!pf) { alert("Select both files."); return; }
+    try {
+      const dr=await parseCsv(df), pr=await parseXlsx(pf);
+      const r=mergeAndDeduplicate(dr,pr);
+      setTxns(r.transactions); setOrphans(r.orphanedLabels); setCogsMap({});
+    } catch(e) { alert("Parse error: "+e.message); }
+  }
+ 
+  function exportJson() {
+    const b=new Blob([JSON.stringify({transactions:withNet,orphanedLabels:orphans,exportedAt:new Date().toISOString()},null,2)],{type:"application/json"});
+    const a=document.createElement("a"); a.href=URL.createObjectURL(b); a.download="resale_ledger.json"; a.click();
+  }
+ 
+  const TH = ({ col, ch }) => (
+    <th onClick={()=>tSort(col)} style={{ padding:"10px 14px", fontFamily:mono, fontSize:9, letterSpacing:"0.1em", textTransform:"uppercase", color:sortCol===col?C.sage:C.dim, cursor:"pointer", whiteSpace:"nowrap", background:"rgba(0,0,0,0.35)", textAlign:"left", userSelect:"none", borderBottom:`1px solid ${C.border}` }}>
+      {ch}{sortCol===col?(sortDir==="asc"?" ↑":" ↓"):""}
+    </th>
+  );
+ 
+  return (
+    <div style={{ minHeight:"100vh", background:C.bg, color:C.pri, fontFamily:sans, position:"relative" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500;700&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0;}
+        ::-webkit-scrollbar{width:4px;height:4px;}
+        ::-webkit-scrollbar-track{background:transparent;}
+        ::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.1);border-radius:99px;}
+        input:focus,button:focus{outline:none;}
+        input[type=number]::-webkit-inner-spin-button{opacity:1;}
+        .rtr{transition:background 0.1s;}
+        .rtr:hover{background:rgba(157,193,131,0.04)!important;}
+ 
+        /* Film grain */
+        body::after{
+          content:"";position:fixed;inset:0;z-index:9999;pointer-events:none;opacity:0.04;
+          background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='300' height='300'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='300' height='300' filter='url(%23n)'/%3E%3C/svg%3E");
+          background-repeat:repeat;background-size:200px;
+        }
+      `}</style>
+ 
+      {/* ── HEADER ── */}
+      <div style={{ padding:"22px 28px 0", display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:14, flexWrap:"wrap" }}>
+        <div>
+          <div style={{ fontSize:17, fontWeight:700, color:C.pri, letterSpacing:"-0.02em" }}>
+            Resale Profit Ledger
+            <span style={{ fontWeight:300, color:C.sage, marginLeft:8, fontSize:13 }}>◆</span>
+          </div>
+          <div style={{ fontFamily:mono, fontSize:10, color:C.dim, marginTop:3 }}>
+            Depop × Pirate Ship &nbsp;·&nbsp; Oct 01 – Dec 25, 2025 &nbsp;·&nbsp; {txns.length} transactions
+          </div>
+        </div>
+        <div style={{ display:"flex", gap:8, alignItems:"center", flexWrap:"wrap" }}>
+          <label style={{ fontFamily:mono, fontSize:9, color:C.dim, display:"flex", alignItems:"center", gap:6 }}>
+            DEPOP CSV
+            <input ref={depopRef} type="file" accept=".csv" style={{ fontSize:9, color:C.mut, background:"rgba(255,255,255,0.05)", border:`1px solid ${C.border}`, borderRadius:C.rs, padding:"4px 8px" }} />
+          </label>
+          <label style={{ fontFamily:mono, fontSize:9, color:C.dim, display:"flex", alignItems:"center", gap:6 }}>
+            PIRATE SHIP XLSX
+            <input ref={psRef} type="file" accept=".xlsx,.csv" style={{ fontSize:9, color:C.mut, background:"rgba(255,255,255,0.05)", border:`1px solid ${C.border}`, borderRadius:C.rs, padding:"4px 8px" }} />
+          </label>
+          <button onClick={upload} style={{ background:C.sage, color:"#0d1a08", border:"none", padding:"9px 18px", borderRadius:C.rs, fontFamily:mono, fontSize:11, fontWeight:700, cursor:"pointer", letterSpacing:"0.04em" }}>
+            Merge →
+          </button>
+          <button onClick={exportJson} style={{ background:"rgba(255,255,255,0.06)", color:C.mut, border:"none", padding:"9px 16px", borderRadius:C.rs, fontFamily:mono, fontSize:11, cursor:"pointer" }}>
+            Export JSON
+          </button>
+        </div>
+      </div>
+ 
+      {/* ── TABS ── */}
+      <div style={{ paddingLeft:20, marginTop:8, display:"flex", borderBottom:`1px solid ${C.border}` }}>
+        <Tab active={tab==="overview"} onClick={()=>setTab("overview")}>Overview</Tab>
+        <Tab active={tab==="ledger"}   onClick={()=>setTab("ledger")}>Ledger</Tab>
+        <Tab active={tab==="issues"}   onClick={()=>setTab("issues")} badge={needsAction}>Issues</Tab>
+        <Tab active={tab==="json"}     onClick={()=>setTab("json")}>JSON</Tab>
+      </div>
+ 
+      {/* ══════════════════════════════════════
+          OVERVIEW
+      ══════════════════════════════════════ */}
+      {tab==="overview" && (
+        <div style={{ padding:"28px 28px 48px", display:"flex", flexDirection:"column", gap:18 }}>
+ 
+          {/* Timeframe toggle */}
+          <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+            {["weekly","monthly","yearly"].map(f => (
+              <Pill key={f} active={tf===f} onClick={()=>setTf(f)}>
+                {f[0].toUpperCase()+f.slice(1)}
+              </Pill>
+            ))}
+            <span style={{ fontFamily:mono, fontSize:9, color:C.dim, marginLeft:8 }}>
+              {filtered.length} sales &nbsp;·&nbsp; {periodDays}d window
+            </span>
+          </div>
+ 
+          {/* ── Hero Three ── */}
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(210px,1fr))", gap:12 }}>
+ 
+            {/* Revenue */}
+            <Glass style={{ padding:"24px 26px" }}>
+              <Lbl style={{ marginBottom:14 }}>Total Revenue</Lbl>
+              <div style={{ fontFamily:mono, fontSize:40, fontWeight:700, color:C.amber, lineHeight:1, letterSpacing:"-0.03em" }}>
+                {fm(totalRev)}
+              </div>
+              <div style={{ fontFamily:mono, fontSize:10, color:C.dim, marginTop:10 }}>
+                {filtered.length} items &nbsp;·&nbsp; avg {fm(totalRev/(filtered.length||1))} / sale
+              </div>
+            </Glass>
+ 
+            {/* Gross Profit */}
+            <Glass style={{ padding:"24px 26px" }}>
+              <Lbl style={{ marginBottom:14 }}>Gross Profit</Lbl>
+              <div style={{ fontFamily:mono, fontSize:40, fontWeight:700, color:grossP>=0?C.sage:C.red, lineHeight:1, letterSpacing:"-0.03em" }}>
+                {fm(grossP)}
+              </div>
+              <div style={{ fontFamily:mono, fontSize:10, color:C.dim, marginTop:10 }}>
+                {pct(grossP, totalRev)} margin
+              </div>
+              {missingCogs>0 && (
+                <div style={{ marginTop:12, background:"rgba(255,191,0,0.08)", borderRadius:C.rs, padding:"6px 10px", fontFamily:mono, fontSize:9, color:C.amber }}>
+                  ⚠ {missingCogs} items missing COGS
+                </div>
+              )}
+            </Glass>
+ 
+            {/* Sales Velocity */}
+            <Glass style={{ padding:"24px 26px" }}>
+              <Lbl style={{ marginBottom:14 }}>Sales Velocity</Lbl>
+              <div style={{ fontFamily:mono, fontSize:40, fontWeight:700, color:C.pri, lineHeight:1, letterSpacing:"-0.03em" }}>
+                {velocity.toFixed(2)}
+              </div>
+              <div style={{ fontFamily:mono, fontSize:10, color:C.dim, marginTop:10 }}>
+                items / day &nbsp;·&nbsp; {(velocity*7).toFixed(1)} / week
+              </div>
+            </Glass>
+ 
+          </div>
+ 
+          {/* ── Sparkline + Needs Action ── */}
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 260px", gap:12 }}>
+ 
+            <Glass style={{ padding:"22px 24px" }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+                <Lbl>Revenue Flow &nbsp;·&nbsp; {tf}</Lbl>
+                <div style={{ fontFamily:mono, fontSize:10, color:C.sage }}>
+                  peak {fm(Math.max(...sparkData,0))}
+                </div>
+              </div>
+              <Sparkline data={sparkData} height={82} />
+              <div style={{ display:"flex", justifyContent:"space-between", fontFamily:mono, fontSize:8, color:C.dim, marginTop:6 }}>
+                <span>start</span><span>end</span>
+              </div>
+            </Glass>
+ 
+            <Glass style={{ padding:"22px 24px", display:"flex", flexDirection:"column" }}>
+              <Lbl style={{ marginBottom:12 }}>Needs Action</Lbl>
+              <div style={{ fontFamily:mono, fontSize:52, fontWeight:700, color:needsAction>0?C.red:C.sage, lineHeight:1 }}>
+                {needsAction}
+              </div>
+              <div style={{ display:"flex", flexDirection:"column", gap:9, marginTop:18, flex:1 }}>
+                {[
+                  ["Missing ship label",    missingLabels,  missingLabels>0?C.red:C.dim],
+                  ["Unmatched PS labels",   orphans.length, orphans.length>0?C.red:C.dim],
+                  ["Missing COGS entry",    missingCogs,    missingCogs>0?C.amber:C.dim],
+                ].map(([lbl, val, col]) => (
+                  <div key={lbl} style={{ display:"flex", justifyContent:"space-between", fontFamily:mono, fontSize:10 }}>
+                    <span style={{ color:C.mut }}>{lbl}</span>
+                    <span style={{ color:col, fontWeight:700 }}>{val}</span>
+                  </div>
+                ))}
+              </div>
+              <button onClick={()=>setTab("issues")} style={{ marginTop:16, background:"rgba(255,107,107,0.1)", border:"none", borderRadius:C.rs, padding:"8px 0", color:C.red, fontFamily:mono, fontSize:9, cursor:"pointer", letterSpacing:"0.08em" }}>
+                VIEW ISSUES →
+              </button>
+            </Glass>
+ 
+          </div>
+ 
+          {/* ── Sourcing Intelligence ── */}
+          {info && (
+            <div>
+              <Lbl style={{ marginBottom:12 }}>Sourcing Intelligence</Lbl>
+              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(190px,1fr))", gap:12 }}>
+ 
+                {[
+                  { tag:"Top Brand · Revenue",    name:info.topBrand.name, rev:info.topBrand.revenue, roi:info.topBrand.roi, of:pct(info.topBrand.revenue,info.totalRev), accent:C.amber },
+                  { tag:"Brand ROI Leader",        name:info.roiBrand.name, rev:info.roiBrand.revenue, roi:info.roiBrand.roi, of:`${info.roiBrand.count} sale${info.roiBrand.count!==1?"s":""}`, accent:C.sage },
+                  { tag:"Top Category · Revenue",  name:info.topCat.name,   rev:info.topCat.revenue,   roi:info.topCat.roi,   of:pct(info.topCat.revenue,info.totalRev),   accent:C.amber },
+                  { tag:"Category ROI Leader",     name:info.roiCat.name,   rev:info.roiCat.revenue,   roi:info.roiCat.roi,   of:`${info.roiCat.count} sale${info.roiCat.count!==1?"s":""}`,   accent:C.sage },
+                ].map(card => (
+                  <Glass key={card.tag} style={{ padding:"20px 22px", borderRadius:C.ri }}>
+                    <Lbl style={{ marginBottom:10 }}>{card.tag}</Lbl>
+                    <div style={{ fontFamily:sans, fontSize:16, fontWeight:700, color:C.pri, marginBottom:14, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                      {card.name}
+                    </div>
+                    <div style={{ display:"flex", gap:18 }}>
+                      <div>
+                        <Lbl style={{ fontSize:8, marginBottom:3 }}>{card.of}</Lbl>
+                        <div style={{ fontFamily:mono, fontSize:15, fontWeight:700, color:card.accent }}>{fm(card.rev)}</div>
+                      </div>
+                      <div>
+                        <Lbl style={{ fontSize:8, marginBottom:3 }}>Margin</Lbl>
+                        <div style={{ fontFamily:mono, fontSize:15, fontWeight:700, color:C.sage }}>{pct(card.rev*card.roi, card.rev)}</div>
+                      </div>
+                    </div>
+                  </Glass>
+                ))}
+ 
+              </div>
+            </div>
+          )}
+ 
+          {/* ── Fee strip ── */}
+          <Glass style={{ padding:"18px 24px" }}>
+            <div style={{ display:"flex", gap:28, flexWrap:"wrap" }}>
+              {[
+                ["Platform Fees",   fm(totalFees),            pct(totalFees,totalRev)+" of rev"],
+                ["Shipping Spend",  fm(totalShip),            pct(totalShip,totalRev)+" of rev"],
+                ["Total Taken",     fm(totalFees+totalShip),  pct(totalFees+totalShip,totalRev)+" of rev"],
+                ["COGS Entered",    fm(totalCogs),            `${withNet.filter(t=>t.cogs!==null).length} / ${withNet.length} items`],
+              ].map(([lbl,val,sub]) => (
+                <div key={lbl}>
+                  <Lbl style={{ marginBottom:4 }}>{lbl}</Lbl>
+                  <div style={{ fontFamily:mono, fontSize:15, fontWeight:700, color:C.mut }}>{val}</div>
+                  <div style={{ fontFamily:mono, fontSize:9, color:C.dim, marginTop:2 }}>{sub}</div>
+                </div>
+              ))}
+            </div>
+          </Glass>
+ 
+        </div>
+      )}
+ 
+      {/* ══════════════════════════════════════
+          LEDGER
+      ══════════════════════════════════════ */}
+      {tab==="ledger" && (
+        <div style={{ padding:"20px 28px" }}>
+          <div style={{ display:"flex", gap:6, marginBottom:16, justifyContent:"space-between", flexWrap:"wrap", alignItems:"center" }}>
+            <div style={{ display:"flex", gap:6 }}>
+              {[["all","All"],["orphaned","Orphaned"],["losses","Losses"]].map(([k,l])=>(
+                <Pill key={k} active={lFilter===k} onClick={()=>setLFilter(k)}>{l}</Pill>
+              ))}
+            </div>
+            <div style={{ fontFamily:mono, fontSize:9, color:C.dim }}>{ledgerRows.length} records</div>
+          </div>
+ 
+          <div style={{ overflowX:"auto", borderRadius:C.r, background:"rgba(0,0,0,0.22)" }}>
+            <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+              <thead>
+                <tr>
+                  <TH col="saleDate"    ch="Date" />
+                  <TH col="buyerName"   ch="Buyer" />
+                  <TH col="brand"       ch="Brand" />
+                  <TH col="category"    ch="Cat." />
+                  <TH col="itemName"    ch="Item" />
+                  <TH col="salePrice"   ch="Sale" />
+                  <TH col="totalFees"   ch="Fees" />
+                  <TH col="labelCost"   ch="Ship" />
+                  <TH col="grossProfit" ch="Gross" />
+                  <th style={{ padding:"10px 14px", fontFamily:mono, fontSize:9, letterSpacing:"0.1em", textTransform:"uppercase", color:C.amber, background:"rgba(0,0,0,0.35)", textAlign:"left", whiteSpace:"nowrap", borderBottom:`1px solid ${C.border}` }}>COGS</th>
+                  <TH col="netProfit"   ch="Net" />
+                </tr>
+              </thead>
+              <tbody>
+                {ledgerRows.map(t => {
+                  const loss = t.grossProfit < 0;
+                  return (
+                    <tr key={t.transactionId} className="rtr" style={{ borderBottom:`1px solid rgba(255,255,255,0.04)` }}>
+                      <td style={{ padding:"10px 14px", fontFamily:mono, fontSize:9, color:C.dim, whiteSpace:"nowrap" }}>{t.saleDate}</td>
+                      <td style={{ padding:"10px 14px", whiteSpace:"nowrap" }}>
+                        <div style={{ fontSize:11, color:C.pri }}>{t.buyerName}</div>
+                        <div style={{ fontFamily:mono, fontSize:8, color:C.dim }}>@{t.buyerUsername}</div>
+                      </td>
+                      <td style={{ padding:"10px 14px", fontSize:10, color:C.mut, whiteSpace:"nowrap" }}>{t.brand}</td>
+                      <td style={{ padding:"10px 14px" }}>
+                        <span style={{ fontFamily:mono, fontSize:8, background:"rgba(157,193,131,0.1)", color:C.sage, borderRadius:4, padding:"2px 7px", whiteSpace:"nowrap" }}>
+                          {t.category}
+                        </span>
+                      </td>
+                      <td style={{ padding:"10px 14px", maxWidth:200, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", fontSize:10, color:C.mut }} title={t.itemName}>{t.itemName}</td>
+                      <td style={{ padding:"10px 14px", fontFamily:mono, fontSize:10, color:C.pri, textAlign:"right", whiteSpace:"nowrap" }}>{fm(t.salePrice)}</td>
+                      <td style={{ padding:"10px 14px", fontFamily:mono, fontSize:10, color:"rgba(255,107,107,0.75)", textAlign:"right", whiteSpace:"nowrap" }}>-{fm(t.totalFees)}</td>
+                      <td style={{ padding:"10px 14px", textAlign:"right", whiteSpace:"nowrap" }}>
+                        {t.isOrphaned
+                          ? <span style={{ fontFamily:mono, fontSize:8, color:C.amber }}>⚠ NO LABEL</span>
+                          : <span style={{ fontFamily:mono, fontSize:10, color:"rgba(255,107,107,0.75)" }}>-{fm(t.labelCost)}</span>}
+                      </td>
+                      <td style={{ padding:"10px 14px", fontFamily:mono, fontSize:10, fontWeight:700, color:loss?C.red:C.sage, textAlign:"right", whiteSpace:"nowrap" }}>
+                        {loss?"-":""}{fm(t.grossProfit)}
+                      </td>
+                      <td style={{ padding:"6px 10px" }}>
+                        <input type="number" step="0.01" min="0" placeholder="0.00"
+                          value={cogsMap[t.transactionId]??""}
+                          onChange={e=>setCogsMap(m=>({...m,[t.transactionId]:e.target.value}))}
+                          style={{ width:64, background:"rgba(255,191,0,0.07)", border:`1px solid rgba(255,191,0,0.18)`, borderRadius:6, color:C.amber, fontFamily:mono, fontSize:10, padding:"5px 7px" }}
+                        />
+                      </td>
+                      <td style={{ padding:"10px 14px", fontFamily:mono, fontSize:10, fontWeight:700, textAlign:"right", whiteSpace:"nowrap",
+                        color:t.netProfit===null?C.dim:t.netProfit<0?C.red:C.sage }}>
+                        {t.netProfit!==null?`${t.netProfit<0?"-":""}${fm(t.netProfit)}`:"—"}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+              <tfoot>
+                <tr style={{ borderTop:`2px solid ${C.border}` }}>
+                  <td colSpan={5} style={{ padding:"12px 14px", fontFamily:mono, fontSize:8, color:C.dim }}>TOTALS · {ledgerRows.length}</td>
+                  <td style={{ padding:"12px 14px", fontFamily:mono, fontSize:10, fontWeight:700, color:C.pri, textAlign:"right" }}>{fm(ledgerRows.reduce((s,t)=>s+t.salePrice,0))}</td>
+                  <td style={{ padding:"12px 14px", fontFamily:mono, fontSize:10, fontWeight:700, color:C.red, textAlign:"right" }}>-{fm(ledgerRows.reduce((s,t)=>s+t.totalFees,0))}</td>
+                  <td style={{ padding:"12px 14px", fontFamily:mono, fontSize:10, fontWeight:700, color:C.red, textAlign:"right" }}>-{fm(ledgerRows.reduce((s,t)=>s+t.labelCost,0))}</td>
+                  <td style={{ padding:"12px 14px", fontFamily:mono, fontSize:10, fontWeight:700, color:C.sage, textAlign:"right" }}>{fm(ledgerRows.reduce((s,t)=>s+t.grossProfit,0))}</td>
+                  <td />
+                  <td style={{ padding:"12px 14px", fontFamily:mono, fontSize:10, fontWeight:700, color:C.sage, textAlign:"right" }}>
+                    {ledgerRows.some(t=>t.netProfit!==null)?fm(ledgerRows.reduce((s,t)=>s+(t.netProfit??t.grossProfit),0)):"—"}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+          <div style={{ marginTop:10, fontFamily:mono, fontSize:8, color:C.dim }}>
+            GROSS = Sale − Depop Payments Fee − Boosting Fee − Pirate Ship Label &nbsp;·&nbsp; NET = Gross − COGS
+          </div>
+        </div>
+      )}
+ 
+      {/* ══════════════════════════════════════
+          ISSUES
+      ══════════════════════════════════════ */}
+      {tab==="issues" && (
+        <div style={{ padding:"24px 28px", display:"flex", flexDirection:"column", gap:22 }}>
+ 
+          <div>
+            <Lbl style={{ color:C.red, marginBottom:12 }}>⚠ Depop sales without a Pirate Ship label</Lbl>
+            <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+              {withNet.filter(t=>t.isOrphaned).map(t => (
+                <Glass key={t.transactionId} style={{ padding:"16px 20px", borderRadius:C.ri, display:"flex", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
+                  <div>
+                    <div style={{ fontWeight:600, fontSize:13 }}>{t.buyerName}</div>
+                    <div style={{ fontFamily:mono, fontSize:9, color:C.dim, marginTop:3 }}>{t.saleDate} · {t.itemName.slice(0,55)}…</div>
+                  </div>
+                  <div style={{ textAlign:"right" }}>
+                    <div style={{ fontFamily:mono, fontSize:13, fontWeight:700, color:C.amber }}>{fm(t.salePrice)}</div>
+                    <div style={{ fontFamily:mono, fontSize:8, color:C.red, marginTop:2 }}>Shipping unknown — gross profit overstated</div>
+                  </div>
+                </Glass>
+              ))}
+              {withNet.filter(t=>t.isOrphaned).length===0 && (
+                <div style={{ fontFamily:mono, fontSize:10, color:C.dim }}>All sales matched ✓</div>
+              )}
+            </div>
+          </div>
+ 
+          <div>
+            <Lbl style={{ color:C.amber, marginBottom:12 }}>⚠ Pirate Ship labels without a Depop sale</Lbl>
+            <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+              {orphans.map((l,i) => (
+                <Glass key={i} style={{ padding:"16px 20px", borderRadius:C.ri, display:"flex", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
+                  <div>
+                    <div style={{ fontWeight:600, fontSize:13 }}>{l.buyerName}</div>
+                    <div style={{ fontFamily:mono, fontSize:9, color:C.dim, marginTop:3 }}>{l.date}</div>
+                  </div>
+                  <div style={{ textAlign:"right" }}>
+                    <div style={{ fontFamily:mono, fontSize:13, fontWeight:700, color:C.red }}>-{fm(l.labelCost)}</div>
+                    <div style={{ fontFamily:mono, fontSize:8, color:C.dim, marginTop:2 }}>May be Poshmark, Mercari, or direct</div>
+                  </div>
+                </Glass>
+              ))}
+            </div>
+          </div>
+ 
+        </div>
+      )}
+ 
+      {/* ══════════════════════════════════════
+          JSON
+      ══════════════════════════════════════ */}
+      {tab==="json" && (
+        <div style={{ padding:"20px 28px" }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+            <Lbl>{txns.length} records · master ledger</Lbl>
+            <button onClick={exportJson} style={{ background:C.sage, color:"#0d1a08", border:"none", borderRadius:C.rs, padding:"7px 16px", fontFamily:mono, fontSize:9, fontWeight:700, cursor:"pointer", letterSpacing:"0.06em" }}>
+              DOWNLOAD .JSON
+            </button>
+          </div>
+          <pre style={{ background:"rgba(0,0,0,0.45)", backdropFilter:"blur(24px)", WebkitBackdropFilter:"blur(24px)", borderRadius:C.ri, padding:20, fontSize:9, color:"rgba(157,193,131,0.8)", overflowX:"auto", maxHeight:600, overflowY:"auto", lineHeight:1.65, fontFamily:mono }}>
+            {JSON.stringify({transactions:withNet,orphanedLabels:orphans},null,2)}
+          </pre>
+        </div>
+      )}
+ 
+    </div>
+  );
+}
