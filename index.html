@@ -1,0 +1,334 @@
+import React, { useState, useCallback, useRef, useMemo, useEffect } from "react";
+import Papa from 'papaparse';
+import * as XLSX from 'xlsx';
+
+// *******************************************************************
+// 1. ENGINE UTILITIES
+// *******************************************************************
+
+const parseMoney = (val) => {
+  if (val === null || val === undefined) return 0;
+  const s = String(val).replace(/[$,]/g, "").trim();
+  if (["", "-", '="-"', '"-"'].includes(s)) return 0;
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+};
+
+const generateHash = (row) => {
+  if (row["Transaction ID"]) return String(row["Transaction ID"]).trim();
+  const raw = `${row["Date of sale"]}_${row["Name"]}_${row["Item price"]}`;
+  let hash = 5381;
+  for (let i = 0; i < raw.length; i++) { hash = ((hash << 5) + hash) ^ raw.charCodeAt(i); }
+  return "H_" + (hash >>> 0).toString(16).toUpperCase();
+};
+
+const normalize = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+
+// *******************************************************************
+// 2. DESIGN SYSTEM (Pro Max Principles: Soft Depth, High Contrast)
+// *******************************************************************
+
+const C = {
+  bg: "#0B0F19",
+  surface: "rgba(30, 41, 59, 0.4)",
+  surfaceHover: "rgba(30, 41, 59, 0.7)",
+  border: "rgba(255, 255, 255, 0.08)",
+  blue: "#3B82F6",
+  sky: "#38BDF8",
+  silver: "#94A3B8",
+  white: "#F8FAFC",
+  red: "#F87171",
+  green: "#34D399",
+  radius: "20px",
+  fontMono: "'JetBrains Mono', ui-monospace, monospace",
+  fontSans: "'Inter', system-ui, sans-serif"
+};
+
+const BentoCard = ({ children, style = {}, hover = false, onClick, colSpan = 1, rowSpan = 1 }) => (
+  <div 
+    onClick={onClick}
+    style={{
+      background: C.surface,
+      backdropFilter: "blur(24px)",
+      WebkitBackdropFilter: "blur(24px)",
+      borderRadius: C.radius,
+      padding: "24px",
+      transition: "all 0.3s cubic-bezier(0.25, 0.1, 0.25, 1)",
+      border: `1px solid ${C.border}`,
+      boxShadow: "0 4px 24px -4px rgba(0,0,0,0.5)",
+      cursor: onClick ? "pointer" : "default",
+      gridColumn: `span ${colSpan}`,
+      gridRow: `span ${rowSpan}`,
+      display: "flex",
+      flexDirection: "column",
+      ...style
+    }} className={hover ? "bento-hover" : ""}>
+    {children}
+  </div>
+);
+
+const Lbl = ({ children, color = C.silver }) => (
+  <div style={{ fontFamily: C.fontSans, fontSize: "11px", fontWeight: 600, color, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: "12px" }}>
+    {children}
+  </div>
+);
+
+// *******************************************************************
+// 3. MAIN APPLICATION
+// *******************************************************************
+
+export default function ArbtApp() {
+  const [txns, setTxns] = useState([]);
+  const [unusedLabels, setUnusedLabels] = useState([]);
+  const [cogs, setCogs] = useState({});
+  const [tab, setTab] = useState("overview");
+  const [matchingTarget, setMatchingTarget] = useState(null);
+
+  const depopIn = useRef();
+  const psIn = useRef();
+
+  const handleProcess = () => {
+    const dFile = depopIn.current.files[0];
+    const pFile = psIn.current.files[0];
+    if (!dFile || !pFile) return alert("Mobilize both files before running audit.");
+
+    Papa.parse(dFile, {
+      header: true,
+      complete: (dResults) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const data = new Uint8Array(e.target.result);
+          const wb = XLSX.read(data, { type: 'array' });
+          const pRows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]]);
+          
+          const labels = pRows.filter(r => r.Type === "Label").map((r, i) => ({
+            labelId: `LBL_${i}`,
+            name: normalize(String(r.Description || "").split(":")[0]),
+            rawName: String(r.Description || "").split(":")[0].trim(),
+            cost: Math.abs(parseMoney(r.Total)),
+            date: r.Date
+          }));
+
+          const masterIds = new Set(txns.map(t => t.id));
+          const newTxns = [];
+          const usedLabelIds = new Set();
+          let duplicates = 0;
+
+          dResults.data.forEach(row => {
+            if (parseMoney(row["Refunded to buyer amount"]) > 0) return;
+            const id = generateHash(row);
+            if (masterIds.has(id)) { duplicates++; return; }
+
+            const buyer = normalize(row["Name"]);
+            const matchIdx = labels.findIndex(l => !usedLabelIds.has(l.labelId) && (l.name === buyer || buyer.includes(l.name)));
+            
+            let labelData = { cost: 0, labelId: null };
+            if (matchIdx !== -1) {
+              labelData = { cost: labels[matchIdx].cost, labelId: labels[matchIdx].labelId };
+              usedLabelIds.add(labels[matchIdx].labelId);
+            }
+
+            newTxns.push({
+              id,
+              date: row["Date of sale"],
+              item: String(row["Description"] || "").split("\n")[0].slice(0, 45),
+              brand: row["Brand"] || "Other",
+              category: row["Category"] || "Other",
+              revenue: parseMoney(row["Item price"]),
+              buyerPaidShip: parseMoney(row["Buyer shipping cost"]),
+              fees: parseMoney(row["Depop fee"]) + parseMoney(row["Depop Payments fee"]) + parseMoney(row["Boosting fee"]),
+              actualShip: labelData.cost,
+              labelId: labelData.labelId,
+              isOrphan: !labelData.labelId
+            });
+          });
+
+          setTxns([...txns, ...newTxns]);
+          setUnusedLabels(labels.filter(l => !usedLabelIds.has(l.labelId)));
+          alert(`Audit Complete. ${duplicates} duplicates ignored.`);
+        };
+        reader.readAsArrayBuffer(pFile);
+      }
+    });
+  };
+
+  const manualLink = (label) => {
+    setTxns(txns.map(t => t.id === matchingTarget ? { ...t, actualShip: label.cost, labelId: label.labelId, isOrphan: false } : t));
+    setUnusedLabels(unusedLabels.filter(l => l.labelId !== label.labelId));
+    setMatchingTarget(null);
+  };
+
+  const deleteTxn = (id) => setTxns(txns.filter(t => t.id !== id));
+
+  const stats = useMemo(() => {
+    const rev = txns.reduce((s, t) => s + t.revenue, 0);
+    const buyerShip = txns.reduce((s, t) => s + t.buyerPaidShip, 0);
+    const actualShip = txns.reduce((s, t) => s + t.actualShip, 0);
+    const fees = txns.reduce((s, t) => s + t.fees, 0);
+    const cost = txns.reduce((s, t) => s + (cogs[t.id] || 0), 0);
+    const shipSpread = buyerShip - actualShip;
+    const netProfit = rev - fees - actualShip - cost + shipSpread;
+
+    const aggregate = (key) => {
+      const map = {};
+      txns.forEach(t => {
+        if (!map[t.key]) map[t[key]] = { rev: 0, sales: 0, profit: 0 };
+        map[t[key]].rev += t.revenue;
+        map[t[key]].sales += 1;
+        map[t[key]].profit += (t.revenue - t.fees - t.actualShip - (cogs[t.id] || 0) + (t.buyerPaidShip - t.actualShip));
+      });
+      return Object.entries(map).map(([name, d]) => ({ name, ...d, roi: (d.profit / (d.rev || 1)) * 100 })).sort((a,b) => b.rev - a.rev);
+    };
+
+    return { 
+      rev, profit: netProfit, margin: (netProfit/rev)*100 || 0, 
+      shipSpread, actualShip, avgShip: actualShip / (txns.filter(t => t.actualShip > 0).length || 1),
+      brands: aggregate("brand"), cats: aggregate("category")
+    };
+  }, [txns, cogs]);
+
+  return (
+    <div style={{ backgroundColor: C.bg, minHeight: "100vh", color: C.white, padding: "40px", fontFamily: C.fontSans }}>
+      <style>{`
+        .bento-hover:hover { background: ${C.surfaceHover} !important; transform: translateY(-2px); border-color: rgba(255,255,255,0.15); }
+        .btn-hover:hover { background: ${C.blue} !important; color: white !important; box-shadow: 0 4px 15px ${C.blue}66; }
+        .tab-btn { background: none; border: none; color: ${C.silver}; cursor: pointer; padding: 10px 20px; font-family: ${C.fontSans}; font-size: 13px; font-weight: 600; transition: 0.2s; border-radius: 8px; }
+        .tab-active { color: ${C.white}; background: rgba(255, 255, 255, 0.1); }
+        input[type="file"]::file-selector-button { background: rgba(255,255,255,0.05); border: 1px solid ${C.border}; color: ${C.silver}; padding: 6px 12px; border-radius: 6px; font-size: 11px; cursor: pointer; transition: 0.2s; }
+        input[type="file"]::file-selector-button:hover { background: rgba(255,255,255,0.1); }
+      `}</style>
+
+      {/* MANUAL MATCH MODAL */}
+      {matchingTarget && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(11, 15, 25, 0.9)", backdropFilter: "blur(8px)", zIndex: 1000, display: "flex", alignItems: "center", justifyContent: "center", padding: "40px" }}>
+          <BentoCard style={{ width: "100%", maxWidth: "500px", maxHeight: "80vh", overflowY: "auto", border: `1px solid ${C.blue}` }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "24px" }}>
+              <h2 style={{ margin: 0, fontSize: "18px", fontWeight: 600 }}>Reconcile Orphan Label</h2>
+              <button onClick={() => setMatchingTarget(null)} style={{ background: "none", border: "none", color: C.silver, cursor: "pointer", fontWeight: 600 }}>CLOSE</button>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+              {unusedLabels.map(l => (
+                <div key={l.labelId} onClick={() => manualLink(l)} style={{ padding: "16px", borderRadius: "12px", border: `1px solid ${C.border}`, cursor: "pointer", background: "rgba(0,0,0,0.2)" }} className="bento-hover">
+                  <div style={{ fontWeight: 600, color: C.white, marginBottom: "4px" }}>{l.rawName}</div>
+                  <div style={{ fontSize: "12px", color: C.silver, fontFamily: C.fontMono }}>Cost: ${l.cost} | Date: {l.date}</div>
+                </div>
+              ))}
+              {unusedLabels.length === 0 && <div style={{ color: C.silver, textAlign: "center", padding: "20px" }}>No unused labels found.</div>}
+            </div>
+          </BentoCard>
+        </div>
+      )}
+
+      {/* HEADER */}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: "32px", borderBottom: `1px solid ${C.border}`, paddingBottom: "24px" }}>
+        <div>
+          <h1 style={{ fontSize: "32px", fontWeight: 800, letterSpacing: "-0.04em", margin: 0 }}>ARBT<span style={{ color: C.blue }}>.</span></h1>
+          <p style={{ color: C.silver, fontSize: "13px", fontWeight: 500, marginTop: "4px" }}>Pro Max Reconciliation Engine</p>
+        </div>
+        <div style={{ display: "flex", gap: "8px", background: "rgba(0,0,0,0.2)", padding: "4px", borderRadius: "10px", border: `1px solid ${C.border}` }}>
+          <button className={`tab-btn ${tab === 'overview' ? 'tab-active' : ''}`} onClick={() => setTab('overview')}>Overview</button>
+          <button className={`tab-btn ${tab === 'ledger' ? 'tab-active' : ''}`} onClick={() => setTab('ledger')}>Audit Ledger</button>
+        </div>
+      </div>
+
+      {tab === 'overview' && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(12, 1fr)", gridAutoRows: "minmax(120px, auto)", gap: "24px" }}>
+          
+          {/* TOP METRICS */}
+          <BentoCard colSpan={3}><Lbl>Gross Revenue</Lbl><div style={{ fontSize: "32px", fontWeight: 700, fontFamily: C.fontMono }}>${stats.rev.toLocaleString()}</div></BentoCard>
+          <BentoCard colSpan={3}><Lbl>Net Profit</Lbl><div style={{ fontSize: "32px", fontWeight: 700, fontFamily: C.fontMono, color: C.blue }}>${stats.profit.toLocaleString()}</div></BentoCard>
+          <BentoCard colSpan={3}><Lbl>Shipping Spread</Lbl><div style={{ fontSize: "32px", fontWeight: 700, fontFamily: C.fontMono, color: stats.shipSpread >= 0 ? C.green : C.red }}>${stats.shipSpread.toFixed(2)}</div></BentoCard>
+          <BentoCard colSpan={3}><Lbl>Profit Margin</Lbl><div style={{ fontSize: "32px", fontWeight: 700, fontFamily: C.fontMono }}>{stats.margin.toFixed(1)}%</div></BentoCard>
+
+          {/* DEBT KILLER (Large Center) */}
+          <BentoCard colSpan={8} rowSpan={2} style={{ justifyContent: "center" }}>
+             <Lbl color={C.sky}>Student Loan Target: $20,000</Lbl>
+             <div style={{ display: "flex", alignItems: "baseline", gap: "16px", marginBottom: "24px" }}>
+                <div style={{ fontSize: "64px", fontWeight: 800, fontFamily: C.fontMono, letterSpacing: "-0.02em" }}>{((stats.profit / 20000) * 100).toFixed(2)}%</div>
+                <div style={{ fontSize: "16px", color: C.silver }}>Cleared</div>
+             </div>
+             <div style={{ height: "12px", background: "rgba(0,0,0,0.4)", borderRadius: "6px", overflow: "hidden", border: `1px solid ${C.border}` }}>
+                <div style={{ width: `${Math.min((stats.profit / 20000) * 100, 100)}%`, height: "100%", background: C.blue, transition: "width 1s ease-in-out" }} />
+             </div>
+             <div style={{ display: "flex", justifyContent: "space-between", marginTop: "12px", fontSize: "13px", color: C.silver, fontFamily: C.fontMono }}>
+                <span>$0</span>
+                <span>${Math.max(20000 - stats.profit, 0).toLocaleString()} Remaining</span>
+             </div>
+          </BentoCard>
+
+          {/* SOURCING INTELLIGENCE */}
+          <BentoCard colSpan={4} rowSpan={2} style={{ overflowY: "auto" }}>
+            <Lbl>Top Brands by ROI</Lbl>
+            <div style={{ display: "flex", flexDirection: "column", gap: "16px" }}>
+              {stats.brands.slice(0, 4).map(b => (
+                <div key={b.name} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${C.border}`, paddingBottom: "12px" }}>
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: "14px", color: C.white }}>{b.name}</div>
+                    <div style={{ fontSize: "11px", color: C.silver, marginTop: "2px" }}>{b.sales} items sold</div>
+                  </div>
+                  <div style={{ textAlign: "right", fontFamily: C.fontMono }}>
+                    <div style={{ color: C.blue, fontWeight: 700 }}>{b.roi.toFixed(0)}%</div>
+                    <div style={{ fontSize: "11px", color: C.silver }}>${b.rev.toLocaleString()}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </BentoCard>
+
+        </div>
+      )}
+
+      {tab === 'ledger' && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "24px" }}>
+          {/* UPLOAD CONTROLS */}
+          <BentoCard style={{ display: "flex", flexDirection: "row", justifyContent: "space-between", alignItems: "center", padding: "20px 24px" }}>
+            <div style={{ display: "flex", gap: "32px" }}>
+              <div><Lbl>Depop Export</Lbl><input ref={depopIn} type="file" /></div>
+              <div><Lbl>Pirate Ship Export</Lbl><input ref={psIn} type="file" /></div>
+            </div>
+            <button className="btn-hover" onClick={handleProcess} style={{ background: "rgba(59, 130, 246, 0.1)", border: `1px solid ${C.blue}`, color: C.blue, padding: "10px 24px", borderRadius: "8px", fontWeight: 600, cursor: "pointer", transition: "all 0.2s" }}>Execute Merge</button>
+          </BentoCard>
+
+          {/* TABLE */}
+          <BentoCard style={{ padding: 0, overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", minWidth: "900px" }}>
+              <thead style={{ background: "rgba(0,0,0,0.2)" }}>
+                <tr>
+                  {["Item Details", "Brand", "Revenue", "Buyer Paid", "Actual Ship", "Spread", "COGS", "Action"].map(h => (
+                    <th key={h} style={{ padding: "16px 24px", textAlign: "left", fontFamily: C.fontSans, fontSize: "11px", fontWeight: 600, color: C.silver, borderBottom: `1px solid ${C.border}` }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {txns.map(t => (
+                  <tr key={t.id} style={{ borderBottom: `1px solid ${C.border}`, background: t.isOrphan ? "rgba(248, 113, 113, 0.05)" : "transparent", transition: "background 0.2s" }}>
+                    <td style={{ padding: "16px 24px" }}>
+                      <div style={{ fontSize: "13px", fontWeight: 500, color: C.white, marginBottom: "4px" }}>{t.item}</div>
+                      <div style={{ fontSize: "11px", color: C.silver }}>{t.date}</div>
+                    </td>
+                    <td style={{ padding: "16px 24px", fontSize: "12px", color: C.silver }}>{t.brand}</td>
+                    <td style={{ padding: "16px 24px", fontFamily: C.fontMono, fontSize: "13px" }}>${t.revenue}</td>
+                    <td style={{ padding: "16px 24px", fontFamily: C.fontMono, fontSize: "13px" }}>${t.buyerPaidShip}</td>
+                    <td style={{ padding: "16px 24px", fontFamily: C.fontMono, fontSize: "13px", color: t.isOrphan ? C.red : C.white }}>{t.isOrphan ? "ORPHAN" : `$${t.actualShip}`}</td>
+                    <td style={{ padding: "16px 24px", fontFamily: C.fontMono, fontSize: "13px", color: (t.buyerPaidShip - t.actualShip) >= 0 ? C.green : C.red }}>
+                      {(t.buyerPaidShip - t.actualShip).toFixed(2)}
+                    </td>
+                    <td style={{ padding: "16px 24px" }}>
+                      <input type="number" placeholder="0.00" value={cogs[t.id] || ""} onChange={(e) => setCogs({...cogs, [t.id]: parseFloat(e.target.value)})}
+                        style={{ background: "rgba(0,0,0,0.3)", border: `1px solid ${C.border}`, borderRadius: "6px", color: C.white, padding: "6px 10px", width: "80px", fontFamily: C.fontMono, outline: "none" }}
+                      />
+                    </td>
+                    <td style={{ padding: "16px 24px", display: "flex", gap: "12px", alignItems: "center", height: "100%" }}>
+                      {t.isOrphan && <button onClick={() => setMatchingTarget(t.id)} style={{ color: C.blue, background: "none", border: "none", cursor: "pointer", fontSize: "11px", fontWeight: 600 }}>LINK</button>}
+                      <button onClick={() => deleteTxn(t.id)} style={{ color: C.red, background: "none", border: "none", cursor: "pointer", fontSize: "11px", fontWeight: 600 }}>DEL</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </BentoCard>
+        </div>
+      )}
+    </div>
+  );
+}
