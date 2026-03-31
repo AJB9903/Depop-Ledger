@@ -31,6 +31,8 @@ function saveState(s) {
       transactions:      s.transactions.map(serializeTxn),
       orphanedLabels:    s.orphanedLabels.map(serializeLabel),
       refundedCount:     s.refundedCount,
+      rawDepop:          s.rawDepop, // <-- ADD THIS
+      rawPs:             s.rawPs,    // <-- ADD THIS
       categoryDefaults:  s.categoryDefaults,
       cogsOverrides:     s.cogsOverrides,
       forceLinks:        s.forceLinks,
@@ -61,6 +63,8 @@ function loadState() {
       deletedIds:        new Set(d.deletedIds        ?? []),
       zeroCogsConfirmed: new Set(d.zeroCogsConfirmed ?? []),
       seenIds:           new Set(d.seenIds           ?? []),
+      rawDepop:          d.rawDepop ?? [], // <-- ADD THIS
+      rawPs:             d.rawPs ?? [],    // <-- ADD THIS
     };
   } catch { return null; }
 }
@@ -89,6 +93,8 @@ function getInitialState() {
       orphanedLabels: s.orphanedLabels,
       orphanedSales:  [],
       refundedCount:  s.refundedCount,
+      rawDepop:       s.rawDepop, // <-- ADD THIS
+      rawPs:          s.rawPs,    // <-- ADD THIS
     },
     categoryDefaults:  s.categoryDefaults,
     cogsOverrides:     s.cogsOverrides,
@@ -216,6 +222,8 @@ export default function App() {
       transactions:      baseResult.transactions,
       orphanedLabels:    baseResult.orphanedLabels,
       refundedCount:     baseResult.refundedCount,
+      rawDepop:          baseResult.rawDepop, // <-- ADD THIS
+      rawPs:             baseResult.rawPs,    // <-- ADD THIS
       categoryDefaults,
       cogsOverrides,
       forceLinks,
