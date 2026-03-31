@@ -7,7 +7,7 @@ import { LayoutDashboard, BookOpen, AlertTriangle, RefreshCw } from 'lucide-reac
 
 import {
   mergeData, computeStats, buildAnalytics, applyForceLinks,
-  parseDepopFile, parsePirateShipFile,
+  parseDepopFile, parsePirateShipFile, dedupeDepopRows, dedupePsRows
 } from './engine.js';
 
 import Onboarding  from './views/Onboarding.jsx';
