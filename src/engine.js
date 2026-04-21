@@ -1,3 +1,6 @@
+ngine · JS
+Copy
+
 /**
  * ARBT Data Engine
  * Parses, merges, deduplicates, and enriches Depop + Pirate Ship data.
@@ -11,7 +14,7 @@
  */
 import Papa from 'papaparse';
 import * as XLSX from 'xlsx';
-
+ 
 // ── MONEY PARSING ──────────────────────────────────────────────────────────────
 export const parseMoney = (val) => {
   if (val === null || val === undefined) return 0;
@@ -20,9 +23,9 @@ export const parseMoney = (val) => {
   const n = parseFloat(s);
   return isNaN(n) ? 0 : n;
 };
-
+ 
 const fmt = (n) => (Math.round(n * 100) / 100);
-
+ 
 // ── HASH ───────────────────────────────────────────────────────────────────────
 const simpleHash = (str) => {
   let h = 5381;
@@ -32,7 +35,7 @@ const simpleHash = (str) => {
   }
   return h.toString(16).padStart(8, '0').toUpperCase();
 };
-
+ 
 // ── NAME NORMALIZATION ─────────────────────────────────────────────────────────
 // Strips middle initials (single-letter words), punctuation, extra spaces.
 // "John A. Smith" → "john smith", "Mary-Jane O'Brien" → "mary jane obrien"
@@ -43,7 +46,7 @@ export const normalizeName = (s) =>
     .replace(/\b[a-z]\b\s*/g, '')      // strip middle initials
     .replace(/\s+/g, ' ')
     .trim();
-
+ 
 // ── FUZZY NAME MATCH ───────────────────────────────────────────────────────────
 export const fuzzyScore = (a, b) => {
   const nA = normalizeName(a);
@@ -58,7 +61,7 @@ export const fuzzyScore = (a, b) => {
   if (overlap > 0) return 0.6 + (overlap / Math.max(wA.length, wB.size)) * 0.25;
   return 0;
 };
-
+ 
 // ── LABEL FINGERPRINT ──────────────────────────────────────────────────────────
 // Tracking number is the gold standard — globally unique per shipment.
 // Fallback: hash of date + cost + first 30 chars of description.
@@ -71,7 +74,7 @@ const makeLabelFp = (r) => {
   const desc  = String(r['Description'] || r['Ship To Name'] || r['Recipient Name'] || '');
   return `H_${simpleHash(`${date}|${cost}|${desc.slice(0, 30)}`)}`;
 };
-
+ 
 // ── DEPOP TRANSACTION ID ───────────────────────────────────────────────────────
 const generateTxnId = (row) => {
   const tid = String(row['Transaction ID'] || '').trim();
@@ -79,12 +82,12 @@ const generateTxnId = (row) => {
   const raw = `${row['Date of sale']}_${row['Name']}_${row['Item price']}`;
   return 'H_' + simpleHash(raw);
 };
-
+ 
 // ── RAW-ROW DEDUPLICATION ──────────────────────────────────────────────────────
 // Called before mergeData when stacking new import batches.
 // Depop: dedup by Transaction ID (stable Depop primary key).
 // Pirate Ship: dedup by label fingerprint (tracking or hash).
-
+ 
 export function dedupeDepopRows(existing, incoming) {
   const knownIds = new Set(
     existing.map(r => String(r['Transaction ID'] || '').trim()).filter(Boolean)
@@ -98,7 +101,7 @@ export function dedupeDepopRows(existing, incoming) {
   }
   return [...existing, ...fresh];
 }
-
+ 
 export function dedupePsRows(existing, incoming) {
   const knownFps = new Set(existing.map(r => makeLabelFp(r)));
   const fresh = [];
@@ -110,7 +113,7 @@ export function dedupePsRows(existing, incoming) {
   }
   return [...existing, ...fresh];
 }
-
+ 
 // ── PIRATE SHIP PARSER ─────────────────────────────────────────────────────────
 export const parsePirateShipRows = (rows) =>
   rows
@@ -131,27 +134,27 @@ export const parsePirateShipRows = (rows) =>
         raw:            r,
       };
     });
-
+ 
 // ── DEPOP PARSER ───────────────────────────────────────────────────────────────
 export const parseDepopRows = (rows) => {
   let refundedCount = 0;
   const sales = [];
-
+ 
   for (const r of rows) {
     const refund = parseMoney(
       r['Refunded to buyer amount'] || r['Refund amount'] || r['Refunded amount'] || 0
     );
     if (refund > 0) { refundedCount++; continue; }
-
+ 
     const price = parseMoney(r['Item price'] || r['Price'] || 0);
     if (!price && !r['Name']) continue;
-
+ 
     const dateOfSale = r['Date of sale']    ? new Date(r['Date of sale'])    : null;
     const dateListed = r['Date of listing'] ? new Date(r['Date of listing']) : null;
     const daysToSell = dateOfSale && dateListed
       ? Math.round((dateOfSale - dateListed) / 86400000)
       : null;
-
+ 
     sales.push({
       transactionId:  generateTxnId(r),
       date:           dateOfSale,
@@ -174,10 +177,10 @@ export const parseDepopRows = (rows) => {
       daysToSell,
     });
   }
-
+ 
   return { sales, refundedCount };
 };
-
+ 
 // ── MERGE & LINK ───────────────────────────────────────────────────────────────
 // Pure function: always called on the COMPLETE raw-row sets.
 // Deduplication is guaranteed at the raw-row layer before this call.
@@ -193,17 +196,17 @@ export const parseDepopRows = (rows) => {
 export function mergeData(depopRows, pirateShipRows) {
   const labels         = parsePirateShipRows(pirateShipRows);
   const { sales, refundedCount } = parseDepopRows(depopRows);
-
+ 
   // Dedup sales within this batch (handles CSV re-export overlap)
   const seenTxnIds  = new Set();
   const usedLabelFps = new Set();
   const transactions = [];
   const orphanedSales = [];
-
+ 
   for (const sale of sales) {
     if (seenTxnIds.has(sale.transactionId)) continue;
     seenTxnIds.add(sale.transactionId);
-
+ 
     // Best-match label within ±3 days
     let bestScore = 0, bestLabel = null;
     for (const label of labels) {
@@ -217,13 +220,13 @@ export function mergeData(depopRows, pirateShipRows) {
         bestLabel = label;
       }
     }
-
+ 
     if (bestLabel) usedLabelFps.add(bestLabel._fp);
-
+ 
     const actualShipping = bestLabel?.cost ?? 0;
     const totalFees      = fmt(sale.depopFee + sale.depopPayFee + sale.boostFee);
     const shippingSpread = fmt(sale.buyerShipping - actualShipping);
-
+ 
     const txn = {
       ...sale,
       actualShipping,
@@ -239,23 +242,23 @@ export function mergeData(depopRows, pirateShipRows) {
       roi:              null,
       isCogsOverridden: false,
     };
-
+ 
     transactions.push(txn);
     if (!bestLabel) orphanedSales.push(txn);
   }
-
+ 
   const orphanedLabels = labels.filter(l => !usedLabelFps.has(l._fp));
-
+ 
   return { transactions, orphanedSales, orphanedLabels, refundedCount };
 }
-
+ 
 // ── FORCE LINK ─────────────────────────────────────────────────────────────────
 // forceLinks: { [transactionId]: labelFp }
 // Uses _fp for stable identity — survives full reparsing.
 export function applyForceLinks(transactions, orphanedLabels, forceLinks) {
   // Build a lookup map from fingerprint → label (fast, O(1) per txn)
   const labelByFp = new Map(orphanedLabels.map(l => [l._fp, l]));
-
+ 
   return transactions.map(txn => {
     const linkFp = forceLinks[txn.transactionId];
     if (linkFp === undefined) return txn;
@@ -275,7 +278,7 @@ export function applyForceLinks(transactions, orphanedLabels, forceLinks) {
     };
   });
 }
-
+ 
 // ── ENRICH WITH COGS & PROFIT ──────────────────────────────────────────────────
 export function computeStats(transactions, categoryDefaults, cogsOverrides) {
   return transactions.map(txn => {
@@ -289,11 +292,11 @@ export function computeStats(transactions, categoryDefaults, cogsOverrides) {
       txn.price - txn.totalFees - txn.actualShipping - cogs + txn.shippingSpread
     );
     const roi = cogs > 0 ? fmt((netProfit / cogs) * 100) : null;
-
+ 
     return { ...txn, cogs, netProfit, roi, isCogsOverridden: isOverridden };
   });
 }
-
+ 
 // ── ANALYTICS ─────────────────────────────────────────────────────────────────
 export function buildAnalytics(enriched) {
   const totalRevenue       = fmt(enriched.reduce((s, t) => s + t.price, 0));
@@ -307,10 +310,10 @@ export function buildAnalytics(enriched) {
   const avgShipSpread      = enriched.length ? fmt(totalShipSpread / enriched.length) : 0;
   const totalCogs          = fmt(enriched.reduce((s, t) => s + t.cogs, 0));
   const profitMargin       = totalRevenue > 0 ? fmt((totalNetProfit / totalRevenue) * 100) : 0;
-
+ 
   const categoryMap = {};
   const brandMap    = {};
-
+ 
   for (const t of enriched) {
     if (!categoryMap[t.category]) {
       categoryMap[t.category] = { revenue: 0, profit: 0, count: 0, daysList: [], sold: 0 };
@@ -320,7 +323,7 @@ export function buildAnalytics(enriched) {
     cm.profit  = fmt(cm.profit  + t.netProfit);
     cm.count++;
     if (t.daysToSell !== null) { cm.daysList.push(t.daysToSell); cm.sold++; }
-
+ 
     if (!brandMap[t.brand]) {
       brandMap[t.brand] = { revenue: 0, profit: 0, count: 0, totalCogs: 0 };
     }
@@ -330,7 +333,7 @@ export function buildAnalytics(enriched) {
     bm.count++;
     bm.totalCogs = fmt(bm.totalCogs + t.cogs);
   }
-
+ 
   const categories = Object.entries(categoryMap).map(([name, d]) => ({
     name,
     revenue:   d.revenue,
@@ -340,7 +343,7 @@ export function buildAnalytics(enriched) {
     avgDays:   d.daysList.length ? fmt(d.daysList.reduce((a, b) => a + b, 0) / d.daysList.length) : null,
     slowItems: d.daysList.filter(d => d > 60).length,
   })).sort((a, b) => b.profit - a.profit);
-
+ 
   const brands = Object.entries(brandMap).map(([name, d]) => ({
     name,
     revenue: d.revenue,
@@ -348,7 +351,7 @@ export function buildAnalytics(enriched) {
     count:   d.count,
     avgRoi:  d.totalCogs > 0 ? fmt((d.profit / d.totalCogs) * 100) : 0,
   })).sort((a, b) => b.profit - a.profit);
-
+ 
   return {
     totalRevenue, totalNetProfit, totalFees, totalCogs,
     totalBuyerShipping, totalShipSpend, totalShipSpread,
@@ -358,7 +361,7 @@ export function buildAnalytics(enriched) {
     itemCount:   enriched.length,
   };
 }
-
+ 
 // ── TEMPORAL FILTER ────────────────────────────────────────────────────────────
 export function filterByTimeframe(transactions, timeframe) {
   if (timeframe === 'all') return transactions;
@@ -369,21 +372,21 @@ export function filterByTimeframe(transactions, timeframe) {
   else if (timeframe === 'year')  cutoff = new Date(now.getFullYear(), 0, 1);
   return transactions.filter(t => t.date instanceof Date && !isNaN(t.date) && t.date >= cutoff);
 }
-
+ 
 // ── CHART DATA BUILDER ─────────────────────────────────────────────────────────
 export function buildChartData(transactions, timeframe) {
   if (!transactions.length) return { cashFlow: [], categoryBreakdown: [], shippingSpread: [] };
-
+ 
   const getBucket = (date) => {
     if (!date || isNaN(date)) return null;
     if (timeframe === 'week')  return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     if (timeframe === 'month') return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
     return date.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
   };
-
+ 
   const buckets = {};
   const txnsSorted = [...transactions].sort((a, b) => (a.date ?? 0) - (b.date ?? 0));
-
+ 
   txnsSorted.forEach(t => {
     const key = getBucket(t.date);
     if (!key) return;
@@ -395,7 +398,7 @@ export function buildChartData(transactions, timeframe) {
     b.actualCost += t.actualShipping;
     b.count++;
   });
-
+ 
   const cashFlow = Object.values(buckets).map(b => ({
     date:       b.date,
     revenue:    fmt(b.revenue),
@@ -405,7 +408,7 @@ export function buildChartData(transactions, timeframe) {
     spread:     fmt(b.buyerPaid - b.actualCost),
     count:      b.count,
   }));
-
+ 
   const catMap = {};
   transactions.forEach(t => {
     catMap[t.category] = fmt((catMap[t.category] ?? 0) + t.price);
@@ -413,39 +416,39 @@ export function buildChartData(transactions, timeframe) {
   const categoryBreakdown = Object.entries(catMap)
     .map(([name, value]) => ({ name, value }))
     .sort((a, b) => b.value - a.value);
-
+ 
   return { cashFlow, categoryBreakdown, shippingSpread: cashFlow };
 }
-
+ 
 // ── VELOCITY INSIGHTS ──────────────────────────────────────────────────────────
 export function buildVelocityInsights(enriched) {
   const catDays = {};
-
+ 
   enriched.forEach(t => {
     if (t.daysToSell === null || t.daysToSell < 0) return;
     if (!catDays[t.category]) catDays[t.category] = { days: [], totalProfit: 0 };
     catDays[t.category].days.push(t.daysToSell);
     catDays[t.category].totalProfit += t.netProfit;
   });
-
+ 
   const catVelocity = Object.entries(catDays).map(([name, d]) => ({
     name,
     avgDays:   Math.round(d.days.reduce((a, b) => a + b, 0) / d.days.length),
     count:     d.days.length,
     avgProfit: fmt(d.totalProfit / d.days.length),
   })).filter(c => c.count >= 1).sort((a, b) => a.avgDays - b.avgDays);
-
+ 
   const capitalTraps = enriched
     .filter(t => t.daysToSell !== null && t.daysToSell > 90 && t.netProfit > 0)
     .sort((a, b) => b.daysToSell - a.daysToSell)
     .slice(0, 8);
-
+ 
   const itemsWithDates = enriched.filter(t => t.daysToSell !== null && t.daysToSell >= 0);
   const soldIn30       = itemsWithDates.filter(t => t.daysToSell <= 30);
   const str30          = itemsWithDates.length > 0
     ? fmt((soldIn30.length / itemsWithDates.length) * 100)
     : null;
-
+ 
   const monthlyGroups = {};
   enriched.forEach(t => {
     if (!t.date || isNaN(t.date)) return;
@@ -457,7 +460,7 @@ export function buildVelocityInsights(enriched) {
   const projectedMonthlyProfit = monthlyProfits.length > 0
     ? fmt(monthlyProfits.reduce((a, b) => a + b, 0) / monthlyProfits.length)
     : 0;
-
+ 
   return {
     fastMovers:            catVelocity.slice(0, 4),
     capitalTraps,
@@ -466,7 +469,7 @@ export function buildVelocityInsights(enriched) {
     hasDateData:           itemsWithDates.length > 0,
   };
 }
-
+ 
 // ── UNIQUE CATEGORIES ──────────────────────────────────────────────────────────
 export function getUniqueCategories(depopRows) {
   const cats = new Set();
@@ -476,7 +479,7 @@ export function getUniqueCategories(depopRows) {
   });
   return [...cats].sort();
 }
-
+ 
 // ── FILE PARSERS ───────────────────────────────────────────────────────────────
 export const parseDepopFile = (file) =>
   new Promise((resolve, reject) =>
@@ -487,7 +490,7 @@ export const parseDepopFile = (file) =>
       error: reject,
     })
   );
-
+ 
 export const parsePirateShipFile = (file) => {
   const ext = file.name.split('.').pop().toLowerCase();
   if (ext === 'csv') return parseDepopFile(file);
@@ -503,3 +506,70 @@ export const parsePirateShipFile = (file) => {
     reader.readAsArrayBuffer(file);
   });
 };
+ 
+// ── UNIT ECONOMICS ─────────────────────────────────────────────────────────────
+// Per-sale average breakdown of where each dollar goes.
+// category = 'All' or a specific category name.
+// Returns slices ready for a pie chart + headline ROI multiple.
+export function buildUnitEconomics(transactions, category = 'All') {
+  const filtered = category === 'All'
+    ? transactions
+    : transactions.filter(t => t.category === category);
+ 
+  const n = filtered.length;
+  if (!n) {
+    return {
+      sampleSize: 0,
+      avgPrice: 0, avgBuyerShipping: 0, avgGrossReceived: 0,
+      avgCogs: 0, avgDepopFee: 0, avgDepopPayFee: 0, avgBoostFee: 0,
+      avgActualShipping: 0, avgNetProfit: 0,
+      profitPerDollarCogs: null,
+      isProfitable: false,
+      slices: [],
+    };
+  }
+ 
+  const sum = (key) => filtered.reduce((s, t) => s + (t[key] || 0), 0);
+  const avg = (key) => fmt(sum(key) / n);
+ 
+  const avgPrice          = avg('price');
+  const avgBuyerShipping  = avg('buyerShipping');
+  const avgCogs           = avg('cogs');
+  const avgDepopFee       = avg('depopFee');
+  const avgDepopPayFee    = avg('depopPayFee');
+  const avgBoostFee       = avg('boostFee');
+  const avgActualShipping = avg('actualShipping');
+  const avgNetProfit      = avg('netProfit');
+  const avgGrossReceived  = fmt(avgPrice + avgBuyerShipping);
+ 
+  // Pie slices — non-zero only, sorted largest → smallest.
+  // Profit slice clamped to 0 when avg profit is negative; headline takes
+  // over the messaging in that case.
+  const rawSlices = [
+    { key: 'profit',   name: 'Net Profit',      value: Math.max(0, avgNetProfit) },
+    { key: 'cogs',     name: 'COGS',            value: avgCogs },
+    { key: 'shipping', name: 'Actual Shipping', value: avgActualShipping },
+    { key: 'depopFee', name: 'Depop Fee',       value: avgDepopFee },
+    { key: 'payFee',   name: 'Payments Fee',    value: avgDepopPayFee },
+    { key: 'boostFee', name: 'Boost Fee',       value: avgBoostFee },
+  ].filter(s => s.value > 0.001);
+ 
+  const sliceTotal = rawSlices.reduce((s, x) => s + x.value, 0);
+  const slices = rawSlices
+    .map(s => ({
+      ...s,
+      value: fmt(s.value),
+      pct: sliceTotal > 0 ? fmt((s.value / sliceTotal) * 100) : 0,
+    }))
+    .sort((a, b) => b.value - a.value);
+ 
+  return {
+    sampleSize: n,
+    avgPrice, avgBuyerShipping, avgGrossReceived,
+    avgCogs, avgDepopFee, avgDepopPayFee, avgBoostFee,
+    avgActualShipping, avgNetProfit,
+    profitPerDollarCogs: avgCogs > 0 ? fmt(avgNetProfit / avgCogs) : null,
+    isProfitable: avgNetProfit > 0,
+    slices,
+  };
+}
