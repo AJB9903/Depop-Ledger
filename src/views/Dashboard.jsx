@@ -1,6 +1,6 @@
 /**
  * Dashboard — Visual-first home screen
- * Temporal control · Cash flow chart · Category donut · Shipping spread · Velocity insights
+ * Temporal control · Cash flow chart · Category donut · Unit economics · Shipping spread · Velocity insights
  */
 import React, { useState, useMemo } from 'react';
 import {
@@ -14,6 +14,7 @@ import {
 import {
   filterByTimeframe, buildAnalytics, buildChartData, buildVelocityInsights,
 } from '../engine.js';
+import UnitEconomicsCard from './UnitEconomicsCard.jsx';
 
 // ── FORMATTERS ─────────────────────────────────────────────────────────────────
 const fmt$  = (n) => `$${Number(n || 0).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',')}`;
@@ -88,9 +89,9 @@ const TimeControl = ({ value, onChange }) => {
             fontWeight: 600,
             letterSpacing: '0.08em',
             transition: 'all 0.18s ease',
-            background: value === s.id ? 'var(--blue-dim)' : 'transparent',
-            color:      value === s.id ? 'var(--blue)'     : 'var(--silver)',
-            boxShadow:  value === s.id ? '0 0 0 1px var(--border-blue)' : 'none',
+            background:  value === s.id ? 'var(--blue-dim)' : 'transparent',
+            color:       value === s.id ? 'var(--blue)'     : 'var(--silver)',
+            boxShadow:   value === s.id ? '0 0 0 1px var(--border-blue)' : 'none',
           }}
         >
           {s.label.toUpperCase()}
@@ -398,6 +399,11 @@ export default function Dashboard({ transactions, analytics: globalAnalytics, or
                 </div>
               )}
             </div>
+          </div>
+
+          {/* ── ROW 1.5: UNIT ECONOMICS ── */}
+          <div style={{ marginBottom: 20 }}>
+            <UnitEconomicsCard transactions={filtered} />
           </div>
 
           {/* ── ROW 2: SHIPPING SPREAD AREA CHART ── */}
